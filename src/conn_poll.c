@@ -9,6 +9,7 @@
 #include "conn_poll.h"
 #include "agent.h"
 #include "log.h"
+#include "socks5.h"
 #include "socket.h"
 #include "tcp.h"
 #include "thread.h"
@@ -157,6 +158,9 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 		if (conn_impl->tcp_sock != INVALID_SOCKET) {
 			size++;
 		}
+		if (agent->socks5 && socks5_get_control_socket(agent->socks5) != INVALID_SOCKET) {
+			size++;
+		}
 	}
 
 	if (pfds->size != size) {
@@ -216,6 +220,12 @@ int conn_poll_prepare(conn_registry_t *registry, pfds_record_t *pfds, timestamp_
 
 			i++;
 		}
+
+		if (agent->socks5 && socks5_get_control_socket(agent->socks5) != INVALID_SOCKET) {
+			pfds->pfds[i].fd = socks5_get_control_socket(agent->socks5);
+			pfds->pfds[i].events = POLLIN; // Monitor for disconnect
+			i++;
+		}
 	}
 
 	mutex_unlock(&registry->mutex);
@@ -249,6 +259,24 @@ void conn_poll_process_udp(juice_agent_t *agent, struct pollfd *pfd) {
 			if ((ret = conn_poll_recv_udp(conn_impl->udp_sock, buffer, BUFFER_SIZE,
 							&src)) <= 0) {
 				break;
+			}
+
+			// If SOCKS5 is active, unwrap the UDP header
+			if (agent->socks5 && agent->socks5->state == SOCKS5_STATE_READY) {
+				char unwrapped[BUFFER_SIZE];
+				addr_record_t real_src;
+				int data_len =
+				    socks5_unwrap_udp(buffer, (size_t)ret, unwrapped, BUFFER_SIZE, &real_src);
+				if (data_len < 0) {
+					JLOG_WARN("Failed to unwrap SOCKS5 UDP header, dropping datagram");
+					continue;
+				}
+				if (agent_conn_recv(agent, unwrapped, (size_t)data_len, &real_src) != 0) {
+					JLOG_WARN("Agent receive failed");
+					conn_impl->state = CONN_STATE_FINISHED;
+					break;
+				}
+				continue;
 			}
 
 			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
@@ -487,6 +515,26 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 
 		conn_poll_process_tcp(agent, tcp_pfd);
 		i++;
+
+		// Check SOCKS5 control socket for disconnect
+		if (agent->socks5 && socks5_get_control_socket(agent->socks5) != INVALID_SOCKET) {
+			if (pfds->pfds[i].fd != socks5_get_control_socket(agent->socks5)) {
+				break;
+			}
+			if (pfds->pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+				JLOG_WARN("SOCKS5 control connection lost");
+				agent_conn_fail(agent);
+				conn_impl->state = CONN_STATE_FINISHED;
+			} else if (pfds->pfds[i].revents & POLLIN) {
+				// Check if the proxy closed the connection
+				if (!socks5_is_alive(agent->socks5)) {
+					JLOG_WARN("SOCKS5 control connection closed by proxy");
+					agent_conn_fail(agent);
+					conn_impl->state = CONN_STATE_FINISHED;
+				}
+			}
+			i++;
+		}
 	}
 
 	mutex_unlock(&registry->mutex);
@@ -625,6 +673,24 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 		} else {
 			// another datagram is buffered, drop
 			ret = -SEAGAIN;
+		}
+	} else if (agent->socks5 && agent->socks5->state == SOCKS5_STATE_READY) {
+		// Wrap with SOCKS5 UDP header and send to relay address
+		char wrapped[BUFFER_SIZE];
+		int wrapped_len = socks5_wrap_udp(wrapped, BUFFER_SIZE, data, size, dst);
+		if (wrapped_len < 0) {
+			JLOG_WARN("Failed to wrap SOCKS5 UDP header");
+			ret = -1;
+		} else {
+			if (conn_impl->send_ds >= 0 && conn_impl->send_ds != ds) {
+				JLOG_VERBOSE("Setting Differentiated Services field to 0x%X", ds);
+				if (udp_set_diffserv(conn_impl->udp_sock, ds) == 0)
+					conn_impl->send_ds = ds;
+				else
+					conn_impl->send_ds = -1;
+			}
+			ret = udp_sendto(conn_impl->udp_sock, wrapped, (size_t)wrapped_len,
+			                 &agent->socks5->relay_addr);
 		}
 	} else {
 		if (conn_impl->send_ds >= 0 && conn_impl->send_ds != ds) {

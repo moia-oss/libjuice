@@ -11,6 +11,7 @@
 #include "juice.h"
 #include "log.h"
 #include "random.h"
+#include "socks5.h"
 #include "stun.h"
 #include "turn.h"
 #include "udp.h"
@@ -131,12 +132,35 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 		}
 	}
 
+	// Deep-copy SOCKS5 proxy config
+	if (config->socks5_proxy) {
+		agent->config.socks5_proxy = calloc(1, sizeof(juice_socks5_proxy_t));
+		if (!agent->config.socks5_proxy) {
+			JLOG_FATAL("Memory allocation for SOCKS5 proxy config failed");
+			goto error;
+		}
+		agent->config.socks5_proxy->host =
+		    alloc_string_copy(config->socks5_proxy->host, &alloc_failed);
+		agent->config.socks5_proxy->port = config->socks5_proxy->port;
+		agent->config.socks5_proxy->username =
+		    alloc_string_copy(config->socks5_proxy->username, &alloc_failed);
+		agent->config.socks5_proxy->password =
+		    alloc_string_copy(config->socks5_proxy->password, &alloc_failed);
+		if (alloc_failed) {
+			JLOG_FATAL("Memory allocation for SOCKS5 proxy configuration copy failed");
+			goto error;
+		}
+	} else {
+		agent->config.socks5_proxy = NULL;
+	}
+
 	agent->state = JUICE_STATE_DISCONNECTED;
 	agent->mode = AGENT_MODE_UNKNOWN;
 	agent->selected_entry = NULL;
 
 	agent->conn_index = -1;
 	agent->conn_impl = NULL;
+	agent->socks5 = NULL;
 
 	ice_create_local_description(&agent->local);
 
@@ -178,6 +202,19 @@ void agent_destroy(juice_agent_t *agent) {
 		}
 	}
 
+	// Free SOCKS5 context and config
+	if (agent->socks5) {
+		socks5_destroy(agent->socks5);
+		free(agent->socks5);
+		agent->socks5 = NULL;
+	}
+	if (agent->config.socks5_proxy) {
+		free((void *)agent->config.socks5_proxy->host);
+		free((void *)agent->config.socks5_proxy->username);
+		free((void *)agent->config.socks5_proxy->password);
+		free(agent->config.socks5_proxy);
+	}
+
 	// Free strings in config
 	free((void *)agent->config.stun_server_host);
 	for (int i = 0; i < agent->config.turn_servers_count; ++i) {
@@ -206,6 +243,10 @@ static bool has_nonnumeric_server_hostnames(const juice_config_t *config) {
 		if (turn_server->host && !addr_is_numeric_hostname(turn_server->host))
 			return true;
 	}
+
+	if (config->socks5_proxy && config->socks5_proxy->host &&
+	    !addr_is_numeric_hostname(config->socks5_proxy->host))
+		return true;
 
 	return false;
 }
@@ -344,6 +385,78 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 int agent_resolve_servers(juice_agent_t *agent) {
 	conn_lock(agent);
+
+	// SOCKS5 proxy resolution and handshake (must happen before STUN/TURN)
+	if (agent->config.socks5_proxy && agent->config.socks5_proxy->host) {
+		juice_socks5_proxy_t *proxy = agent->config.socks5_proxy;
+
+		if (agent->config.concurrency_mode == JUICE_CONCURRENCY_MODE_MUX) {
+			JLOG_WARN("SOCKS5 proxy is not supported in mux mode");
+		} else {
+			if (!proxy->port)
+				proxy->port = 1080; // default SOCKS5 port
+
+			char hostname[256];
+			char service[8];
+			snprintf(hostname, 256, "%s", proxy->host);
+			snprintf(service, 8, "%hu", proxy->port);
+
+			conn_unlock(agent);
+
+			addr_record_t records[DEFAULT_MAX_RECORDS_COUNT];
+			int records_count =
+			    addr_resolve(hostname, service, SOCK_STREAM, records, DEFAULT_MAX_RECORDS_COUNT);
+
+			conn_lock(agent);
+
+			if (records_count > 0) {
+				// Prefer IPv4
+				addr_record_t *record = NULL;
+				for (int j = 0; j < records_count; ++j) {
+					if (records[j].addr.ss_family == AF_INET) {
+						record = records + j;
+						break;
+					}
+					if (records[j].addr.ss_family == AF_INET6 && !record)
+						record = records + j;
+				}
+
+				if (record) {
+					JLOG_INFO("Using SOCKS5 proxy %s:%s", hostname, service);
+
+					agent->socks5 = calloc(1, sizeof(socks5_context_t));
+					if (!agent->socks5) {
+						JLOG_ERROR("Memory allocation for SOCKS5 context failed");
+					} else {
+						socks5_init(agent->socks5);
+
+						conn_unlock(agent);
+						int ret = socks5_connect(agent->socks5, record, proxy->username,
+						                         proxy->password);
+						conn_lock(agent);
+
+						if (ret < 0) {
+							JLOG_ERROR("SOCKS5 proxy handshake failed");
+							free(agent->socks5);
+							agent->socks5 = NULL;
+						} else {
+							// Add the relay address as a server-reflexive candidate
+							// if no STUN server is configured
+							if (!agent->config.stun_server_host) {
+								addr_record_t relay_addr;
+								if (socks5_get_relay_addr(agent->socks5, &relay_addr) == 0) {
+									agent_add_local_reflexive_candidate(
+									    agent, ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE, &relay_addr);
+								}
+							}
+						}
+					}
+				}
+			} else {
+				JLOG_ERROR("SOCKS5 proxy address resolution failed");
+			}
+		}
+	}
 
 	// TURN server resolution
 	juice_concurrency_mode_t mode = agent->config.concurrency_mode;

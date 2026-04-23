@@ -13,6 +13,7 @@
 #include "conn.h"
 #include "ice.h"
 #include "juice.h"
+#include "socks5.h"
 #include "stun.h"
 #include "tcp.h"
 #include "thread.h"
@@ -151,6 +152,8 @@ struct juice_agent {
 	conn_registry_t *registry;
 	int conn_index;
 	void *conn_impl;
+
+	socks5_context_t *socks5; // NULL if no SOCKS5 proxy configured
 
 	thread_t resolver_thread;
 	bool resolver_thread_started;

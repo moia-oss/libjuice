@@ -9,6 +9,7 @@
 #include "conn_thread.h"
 #include "agent.h"
 #include "log.h"
+#include "socks5.h"
 #include "socket.h"
 #include "thread.h"
 #include "udp.h"
@@ -48,13 +49,20 @@ int conn_thread_prepare(juice_agent_t *agent, struct pollfd *pfd, timestamp_t *n
 		return 0;
 	}
 
-	pfd->fd = conn_impl->sock;
-	pfd->events = POLLIN;
+	pfd[0].fd = conn_impl->sock;
+	pfd[0].events = POLLIN;
+
+	int nfds = 1;
+	if (agent->socks5 && socks5_get_control_socket(agent->socks5) != INVALID_SOCKET) {
+		pfd[1].fd = socks5_get_control_socket(agent->socks5);
+		pfd[1].events = POLLIN;
+		nfds = 2;
+	}
 
 	*next_timestamp = conn_impl->next_timestamp;
 
 	mutex_unlock(&conn_impl->mutex);
-	return 1;
+	return nfds;
 }
 
 int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd) {
@@ -65,18 +73,55 @@ int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd) {
 		return -1;
 	}
 
-	if (pfd->revents & POLLNVAL || pfd->revents & POLLERR) {
+	// Check SOCKS5 control socket for disconnect (pfd[1] if present)
+	if (agent->socks5 && socks5_get_control_socket(agent->socks5) != INVALID_SOCKET) {
+		struct pollfd *socks5_pfd = &pfd[1];
+		if (socks5_pfd->revents & (POLLHUP | POLLERR | POLLNVAL)) {
+			JLOG_WARN("SOCKS5 control connection lost");
+			agent_conn_fail(agent);
+			mutex_unlock(&conn_impl->mutex);
+			return -1;
+		}
+		if (socks5_pfd->revents & POLLIN) {
+			if (!socks5_is_alive(agent->socks5)) {
+				JLOG_WARN("SOCKS5 control connection closed by proxy");
+				agent_conn_fail(agent);
+				mutex_unlock(&conn_impl->mutex);
+				return -1;
+			}
+		}
+	}
+
+	if (pfd[0].revents & POLLNVAL || pfd[0].revents & POLLERR) {
 		JLOG_ERROR("Error when polling socket");
 		agent_conn_fail(agent);
 		mutex_unlock(&conn_impl->mutex);
 		return -1;
 	}
 
-	if (pfd->revents & POLLIN) {
+	if (pfd[0].revents & POLLIN) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t src;
 		int ret;
 		while ((ret = conn_thread_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
+			// If SOCKS5 is active, unwrap the UDP header
+			if (agent->socks5 && agent->socks5->state == SOCKS5_STATE_READY) {
+				char unwrapped[BUFFER_SIZE];
+				addr_record_t real_src;
+				int data_len =
+				    socks5_unwrap_udp(buffer, (size_t)ret, unwrapped, BUFFER_SIZE, &real_src);
+				if (data_len < 0) {
+					JLOG_WARN("Failed to unwrap SOCKS5 UDP header, dropping datagram");
+					continue;
+				}
+				if (agent_conn_recv(agent, unwrapped, (size_t)data_len, &real_src) != 0) {
+					JLOG_WARN("Agent receive failed");
+					mutex_unlock(&conn_impl->mutex);
+					return -1;
+				}
+				continue;
+			}
+
 			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 				JLOG_WARN("Agent receive failed");
 				mutex_unlock(&conn_impl->mutex);
@@ -129,15 +174,16 @@ int conn_thread_recv(socket_t sock, char *buffer, size_t size, addr_record_t *sr
 }
 
 int conn_thread_run(juice_agent_t *agent) {
-	struct pollfd pfd[1];
+	struct pollfd pfd[2]; // UDP socket + optional SOCKS5 control socket
 	timestamp_t next_timestamp;
-	while (conn_thread_prepare(agent, pfd, &next_timestamp) > 0) {
+	int nfds;
+	while ((nfds = conn_thread_prepare(agent, pfd, &next_timestamp)) > 0) {
 		timediff_t timediff = next_timestamp - current_timestamp();
 		if (timediff < 0)
 			timediff = 0;
 
 		JLOG_VERBOSE("Entering poll for %d ms", (int)timediff);
-		int ret = poll(pfd, 1, (int)timediff);
+		int ret = poll(pfd, (nfds_t)nfds, (int)timediff);
 		JLOG_VERBOSE("Leaving poll");
 		if (ret < 0) {
 			if (sockerrno == SEINTR || sockerrno == SEAGAIN) {
@@ -258,7 +304,21 @@ int conn_thread_send(juice_agent_t *agent, const addr_record_t *dst, const char 
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	int ret = udp_sendto(conn_impl->sock, data, size, dst);
+	int ret;
+	if (agent->socks5 && agent->socks5->state == SOCKS5_STATE_READY) {
+		// Wrap with SOCKS5 UDP header and send to relay address
+		char wrapped[BUFFER_SIZE];
+		int wrapped_len = socks5_wrap_udp(wrapped, BUFFER_SIZE, data, size, dst);
+		if (wrapped_len < 0) {
+			JLOG_WARN("Failed to wrap SOCKS5 UDP header");
+			ret = -1;
+		} else {
+			ret = udp_sendto(conn_impl->sock, wrapped, (size_t)wrapped_len,
+			                 &agent->socks5->relay_addr);
+		}
+	} else {
+		ret = udp_sendto(conn_impl->sock, data, size, dst);
+	}
 	if (ret < 0) {
 		ret = -sockerrno;
 		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
