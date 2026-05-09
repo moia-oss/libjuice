@@ -259,10 +259,19 @@ int socks5_connect(socks5_context_t *ctx, const addr_record_t *proxy_addr,
 	buf[0] = SOCKS5_VERSION;
 	buf[1] = SOCKS5_CMD_UDP_ASSOCIATE;
 	buf[2] = 0x00; // reserved
-	buf[3] = SOCKS5_ATYP_IPV4;
-	memset(buf + 4, 0, 4); // 0.0.0.0
-	memset(buf + 8, 0, 2); // port 0
-	if (send_all(ctx->control_sock, buf, 10) < 0) {
+	int request_len;
+	if (family == AF_INET6) {
+		buf[3] = SOCKS5_ATYP_IPV6;
+		memset(buf + 4, 0, 16); // ::
+		memset(buf + 20, 0, 2); // port 0
+		request_len = 22;
+	} else {
+		buf[3] = SOCKS5_ATYP_IPV4;
+		memset(buf + 4, 0, 4); // 0.0.0.0
+		memset(buf + 8, 0, 2); // port 0
+		request_len = 10;
+	}
+	if (send_all(ctx->control_sock, buf, request_len) < 0) {
 		JLOG_ERROR("Failed to send SOCKS5 UDP ASSOCIATE request");
 		goto error;
 	}

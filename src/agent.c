@@ -11,7 +11,6 @@
 #include "juice.h"
 #include "log.h"
 #include "random.h"
-#include "socks5.h"
 #include "stun.h"
 #include "turn.h"
 #include "udp.h"
@@ -160,7 +159,6 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 
 	agent->conn_index = -1;
 	agent->conn_impl = NULL;
-	agent->socks5 = NULL;
 
 	ice_create_local_description(&agent->local);
 
@@ -202,12 +200,7 @@ void agent_destroy(juice_agent_t *agent) {
 		}
 	}
 
-	// Free SOCKS5 context and config
-	if (agent->socks5) {
-		socks5_destroy(agent->socks5);
-		free(agent->socks5);
-		agent->socks5 = NULL;
-	}
+	// Free SOCKS5 proxy config
 	if (agent->config.socks5_proxy) {
 		free((void *)agent->config.socks5_proxy->host);
 		free((void *)agent->config.socks5_proxy->username);
@@ -276,6 +269,12 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	socket_config.bind_address = agent->config.bind_address;
 	socket_config.port_begin = agent->config.local_port_range_begin;
 	socket_config.port_end = agent->config.local_port_range_end;
+	if (agent->config.socks5_proxy) {
+		socket_config.proxy_host = agent->config.socks5_proxy->host;
+		socket_config.proxy_port = agent->config.socks5_proxy->port;
+		socket_config.proxy_username = agent->config.socks5_proxy->username;
+		socket_config.proxy_password = agent->config.socks5_proxy->password;
+	}
 
 	if (conn_create(agent, &socket_config)) {
 		JLOG_FATAL("Connection creation for agent failed");
@@ -386,74 +385,14 @@ int agent_gather_candidates(juice_agent_t *agent) {
 int agent_resolve_servers(juice_agent_t *agent) {
 	conn_lock(agent);
 
-	// SOCKS5 proxy resolution and handshake (must happen before STUN/TURN)
+	// If a SOCKS5 proxy is configured and no STUN server is set,
+	// add the relay address as a server-reflexive candidate
 	if (agent->config.socks5_proxy && agent->config.socks5_proxy->host) {
-		juice_socks5_proxy_t *proxy = agent->config.socks5_proxy;
-
-		if (agent->config.concurrency_mode == JUICE_CONCURRENCY_MODE_MUX) {
-			JLOG_WARN("SOCKS5 proxy is not supported in mux mode");
-		} else {
-			if (!proxy->port)
-				proxy->port = 1080; // default SOCKS5 port
-
-			char hostname[256];
-			char service[8];
-			snprintf(hostname, 256, "%s", proxy->host);
-			snprintf(service, 8, "%hu", proxy->port);
-
-			conn_unlock(agent);
-
-			addr_record_t records[DEFAULT_MAX_RECORDS_COUNT];
-			int records_count =
-			    addr_resolve(hostname, service, SOCK_STREAM, records, DEFAULT_MAX_RECORDS_COUNT);
-
-			conn_lock(agent);
-
-			if (records_count > 0) {
-				// Prefer IPv4
-				addr_record_t *record = NULL;
-				for (int j = 0; j < records_count; ++j) {
-					if (records[j].addr.ss_family == AF_INET) {
-						record = records + j;
-						break;
-					}
-					if (records[j].addr.ss_family == AF_INET6 && !record)
-						record = records + j;
-				}
-
-				if (record) {
-					JLOG_INFO("Using SOCKS5 proxy %s:%s", hostname, service);
-
-					agent->socks5 = calloc(1, sizeof(socks5_context_t));
-					if (!agent->socks5) {
-						JLOG_ERROR("Memory allocation for SOCKS5 context failed");
-					} else {
-						socks5_init(agent->socks5);
-
-						conn_unlock(agent);
-						int ret = socks5_connect(agent->socks5, record, proxy->username,
-						                         proxy->password);
-						conn_lock(agent);
-
-						if (ret < 0) {
-							JLOG_ERROR("SOCKS5 proxy handshake failed");
-							free(agent->socks5);
-							agent->socks5 = NULL;
-						} else {
-							// Add the relay address as a server-reflexive candidate
-							// if no STUN server is configured
-							if (!agent->config.stun_server_host) {
-								addr_record_t relay_addr;
-								if (socks5_get_relay_addr(agent->socks5, &relay_addr) == 0) {
-									agent_add_local_reflexive_candidate(
-									    agent, ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE, &relay_addr);
-								}
-							}
-						}
-					}
-				}
-			} else {
-				JLOG_ERROR("SOCKS5 proxy address resolution failed");
+		if (!agent->config.stun_server_host) {
+			addr_record_t relay_addr;
+			if (conn_get_relay_addr(agent, &relay_addr) == 0) {
+				agent_add_local_reflexive_candidate(
+				    agent, ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE, &relay_addr);
 			}
 		}
 	}

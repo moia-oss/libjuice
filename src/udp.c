@@ -10,6 +10,7 @@
 #include "addr.h"
 #include "log.h"
 #include "random.h"
+#include "socks5.h"
 #include "thread.h" // for mutexes
 
 #include <assert.h>
@@ -176,7 +177,7 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 	return INVALID_SOCKET;
 }
 
-int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+int udp_recvfrom_raw(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
 	while (true) {
 		src->len = sizeof(src->addr);
 		src->socktype = SOCK_DGRAM;
@@ -201,7 +202,7 @@ int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
 	}
 }
 
-int udp_sendto(socket_t sock, const char *data, size_t size, const addr_record_t *dst) {
+int udp_sendto_raw(socket_t sock, const char *data, size_t size, const addr_record_t *dst) {
 #ifndef __linux__
 	addr_record_t tmp = *dst;
 	addr_record_t name;
@@ -608,4 +609,136 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 #endif
 
 	return ret;
+}
+
+#define UDP_SOCKS5_BUFFER_SIZE 4096
+#define DEFAULT_MAX_RECORDS_COUNT 16
+
+int udp_open(udp_socket_context_t *ctx, const udp_socket_config_t *config) {
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->sock = INVALID_SOCKET;
+	ctx->socks5 = NULL;
+
+	ctx->sock = udp_create_socket(config);
+	if (ctx->sock == INVALID_SOCKET)
+		return -1;
+
+	if (config->proxy_host && *config->proxy_host) {
+		uint16_t port = config->proxy_port ? config->proxy_port : 1080;
+
+		char service[8];
+		snprintf(service, sizeof(service), "%hu", port);
+
+		addr_record_t records[DEFAULT_MAX_RECORDS_COUNT];
+		int records_count =
+		    addr_resolve(config->proxy_host, service, SOCK_STREAM, records, DEFAULT_MAX_RECORDS_COUNT);
+
+		if (records_count <= 0) {
+			JLOG_ERROR("SOCKS5 proxy address resolution failed");
+			closesocket(ctx->sock);
+			ctx->sock = INVALID_SOCKET;
+			return -1;
+		}
+
+		addr_record_t *record = NULL;
+		for (int j = 0; j < records_count; ++j) {
+			if (records[j].addr.ss_family == AF_INET) {
+				record = records + j;
+				break;
+			}
+			if (records[j].addr.ss_family == AF_INET6 && !record)
+				record = records + j;
+		}
+
+		if (!record) {
+			JLOG_ERROR("No suitable address found for SOCKS5 proxy");
+			closesocket(ctx->sock);
+			ctx->sock = INVALID_SOCKET;
+			return -1;
+		}
+
+		ctx->socks5 = calloc(1, sizeof(socks5_context_t));
+		if (!ctx->socks5) {
+			JLOG_ERROR("Memory allocation for SOCKS5 context failed");
+			closesocket(ctx->sock);
+			ctx->sock = INVALID_SOCKET;
+			return -1;
+		}
+
+		socks5_init(ctx->socks5);
+		int ret = socks5_connect(ctx->socks5, record, config->proxy_username,
+		                         config->proxy_password);
+		if (ret < 0) {
+			JLOG_ERROR("SOCKS5 proxy handshake failed");
+			free(ctx->socks5);
+			ctx->socks5 = NULL;
+			closesocket(ctx->sock);
+			ctx->sock = INVALID_SOCKET;
+			return -1;
+		}
+
+		JLOG_INFO("SOCKS5 proxy connected");
+	}
+
+	return 0;
+}
+
+void udp_close(udp_socket_context_t *ctx) {
+	if (ctx->socks5) {
+		socks5_destroy(ctx->socks5);
+		free(ctx->socks5);
+		ctx->socks5 = NULL;
+	}
+	if (ctx->sock != INVALID_SOCKET) {
+		closesocket(ctx->sock);
+		ctx->sock = INVALID_SOCKET;
+	}
+}
+
+int udp_sendto(udp_socket_context_t *ctx, const char *data, size_t size, const addr_record_t *dst) {
+	if (ctx->socks5 && ctx->socks5->state == SOCKS5_STATE_READY) {
+		char wrapped[UDP_SOCKS5_BUFFER_SIZE];
+		int wrapped_len = socks5_wrap_udp(wrapped, UDP_SOCKS5_BUFFER_SIZE, data, size, dst);
+		if (wrapped_len < 0) {
+			JLOG_WARN("Failed to wrap SOCKS5 UDP header");
+			return -1;
+		}
+		return udp_sendto_raw(ctx->sock, wrapped, (size_t)wrapped_len, &ctx->socks5->relay_addr);
+	}
+	return udp_sendto_raw(ctx->sock, data, size, dst);
+}
+
+int udp_recvfrom(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src) {
+	if (ctx->socks5 && ctx->socks5->state == SOCKS5_STATE_READY) {
+		char raw[UDP_SOCKS5_BUFFER_SIZE];
+		addr_record_t relay_src;
+		int len = udp_recvfrom_raw(ctx->sock, raw, UDP_SOCKS5_BUFFER_SIZE, &relay_src);
+		if (len <= 0)
+			return len;
+		int data_len = socks5_unwrap_udp(raw, (size_t)len, buffer, size, src);
+		if (data_len < 0) {
+			JLOG_WARN("Failed to unwrap SOCKS5 UDP header, dropping datagram");
+			return 0;
+		}
+		return data_len;
+	}
+	return udp_recvfrom_raw(ctx->sock, buffer, size, src);
+}
+
+socket_t udp_get_control_socket(const udp_socket_context_t *ctx) {
+	if (ctx->socks5)
+		return socks5_get_control_socket(ctx->socks5);
+	return INVALID_SOCKET;
+}
+
+int udp_get_relay_addr(const udp_socket_context_t *ctx, addr_record_t *relay_addr) {
+	if (ctx->socks5)
+		return socks5_get_relay_addr(ctx->socks5, relay_addr);
+	return -1;
+}
+
+bool udp_is_proxy_alive(const udp_socket_context_t *ctx) {
+	if (ctx->socks5)
+		return socks5_is_alive(ctx->socks5);
+	return false;
 }

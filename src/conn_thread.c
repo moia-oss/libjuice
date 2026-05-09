@@ -9,7 +9,6 @@
 #include "conn_thread.h"
 #include "agent.h"
 #include "log.h"
-#include "socks5.h"
 #include "socket.h"
 #include "thread.h"
 #include "udp.h"
@@ -21,7 +20,7 @@
 
 typedef struct conn_impl {
 	thread_t thread;
-	socket_t sock;
+	udp_socket_context_t udp;
 	mutex_t mutex;
 	mutex_t send_mutex;
 	int send_ds;
@@ -32,7 +31,7 @@ typedef struct conn_impl {
 int conn_thread_run(juice_agent_t *agent);
 int conn_thread_prepare(juice_agent_t *agent, struct pollfd *pfd, timestamp_t *next_timestamp);
 int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd);
-int conn_thread_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src);
+int conn_thread_recv(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src);
 
 static thread_return_t THREAD_CALL conn_thread_entry(void *arg) {
 	thread_set_name_self("juice agent");
@@ -49,12 +48,13 @@ int conn_thread_prepare(juice_agent_t *agent, struct pollfd *pfd, timestamp_t *n
 		return 0;
 	}
 
-	pfd[0].fd = conn_impl->sock;
+	pfd[0].fd = conn_impl->udp.sock;
 	pfd[0].events = POLLIN;
 
 	int nfds = 1;
-	if (agent->socks5 && socks5_get_control_socket(agent->socks5) != INVALID_SOCKET) {
-		pfd[1].fd = socks5_get_control_socket(agent->socks5);
+	socket_t control_sock = udp_get_control_socket(&conn_impl->udp);
+	if (control_sock != INVALID_SOCKET) {
+		pfd[1].fd = control_sock;
 		pfd[1].events = POLLIN;
 		nfds = 2;
 	}
@@ -74,7 +74,7 @@ int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd) {
 	}
 
 	// Check SOCKS5 control socket for disconnect (pfd[1] if present)
-	if (agent->socks5 && socks5_get_control_socket(agent->socks5) != INVALID_SOCKET) {
+	if (udp_get_control_socket(&conn_impl->udp) != INVALID_SOCKET) {
 		struct pollfd *socks5_pfd = &pfd[1];
 		if (socks5_pfd->revents & (POLLHUP | POLLERR | POLLNVAL)) {
 			JLOG_WARN("SOCKS5 control connection lost");
@@ -83,7 +83,7 @@ int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd) {
 			return -1;
 		}
 		if (socks5_pfd->revents & POLLIN) {
-			if (!socks5_is_alive(agent->socks5)) {
+			if (!udp_is_proxy_alive(&conn_impl->udp)) {
 				JLOG_WARN("SOCKS5 control connection closed by proxy");
 				agent_conn_fail(agent);
 				mutex_unlock(&conn_impl->mutex);
@@ -103,25 +103,7 @@ int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t src;
 		int ret;
-		while ((ret = conn_thread_recv(conn_impl->sock, buffer, BUFFER_SIZE, &src)) > 0) {
-			// If SOCKS5 is active, unwrap the UDP header
-			if (agent->socks5 && agent->socks5->state == SOCKS5_STATE_READY) {
-				char unwrapped[BUFFER_SIZE];
-				addr_record_t real_src;
-				int data_len =
-				    socks5_unwrap_udp(buffer, (size_t)ret, unwrapped, BUFFER_SIZE, &real_src);
-				if (data_len < 0) {
-					JLOG_WARN("Failed to unwrap SOCKS5 UDP header, dropping datagram");
-					continue;
-				}
-				if (agent_conn_recv(agent, unwrapped, (size_t)data_len, &real_src) != 0) {
-					JLOG_WARN("Agent receive failed");
-					mutex_unlock(&conn_impl->mutex);
-					return -1;
-				}
-				continue;
-			}
-
+		while ((ret = conn_thread_recv(&conn_impl->udp, buffer, BUFFER_SIZE, &src)) > 0) {
 			if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 				JLOG_WARN("Agent receive failed");
 				mutex_unlock(&conn_impl->mutex);
@@ -153,11 +135,11 @@ int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd) {
 	return 0;
 }
 
-int conn_thread_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+int conn_thread_recv(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src) {
 	JLOG_VERBOSE("Receiving datagram");
 	int len;
-	while ((len = udp_recvfrom(sock, buffer, size, src)) == 0) {
-		// Empty datagram (used to interrupt)
+	while ((len = udp_recvfrom(ctx, buffer, size, src)) == 0) {
+		// Empty datagram (used to interrupt) or SOCKS5 unwrap failure
 	}
 
 	if (len < 0) {
@@ -212,8 +194,7 @@ int conn_thread_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket
 		return -1;
 	}
 
-	conn_impl->sock = udp_create_socket(config);
-	if (conn_impl->sock == INVALID_SOCKET) {
+	if (udp_open(&conn_impl->udp, config) < 0) {
 		JLOG_ERROR("UDP socket creation failed");
 		free(conn_impl);
 		return -1;
@@ -248,7 +229,7 @@ void conn_thread_cleanup(juice_agent_t *agent) {
 	JLOG_VERBOSE("Waiting for connection thread");
 	thread_join(conn_impl->thread, NULL);
 
-	closesocket(conn_impl->sock);
+	udp_close(&conn_impl->udp);
 	mutex_destroy(&conn_impl->mutex);
 	mutex_destroy(&conn_impl->send_mutex);
 	free(agent->conn_impl);
@@ -276,7 +257,7 @@ int conn_thread_interrupt(juice_agent_t *agent) {
 
 	mutex_lock(&conn_impl->send_mutex);
 	char dummy = 0; // Some C libraries might error out on NULL pointers
-	if (udp_sendto_self(conn_impl->sock, &dummy, 0) < 0) {
+	if (udp_sendto_self(conn_impl->udp.sock, &dummy, 0) < 0) {
 		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
 			JLOG_WARN("Failed to interrupt poll by triggering socket, errno=%d", sockerrno);
 		}
@@ -296,7 +277,7 @@ int conn_thread_send(juice_agent_t *agent, const addr_record_t *dst, const char 
 
 	if (conn_impl->send_ds >= 0 && conn_impl->send_ds != ds) {
 		JLOG_VERBOSE("Setting Differentiated Services field to 0x%X", ds);
-		if (udp_set_diffserv(conn_impl->sock, ds) == 0)
+		if (udp_set_diffserv(conn_impl->udp.sock, ds) == 0)
 			conn_impl->send_ds = ds;
 		else
 			conn_impl->send_ds = -1; // disable for next time
@@ -304,21 +285,7 @@ int conn_thread_send(juice_agent_t *agent, const addr_record_t *dst, const char 
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	int ret;
-	if (agent->socks5 && agent->socks5->state == SOCKS5_STATE_READY) {
-		// Wrap with SOCKS5 UDP header and send to relay address
-		char wrapped[BUFFER_SIZE];
-		int wrapped_len = socks5_wrap_udp(wrapped, BUFFER_SIZE, data, size, dst);
-		if (wrapped_len < 0) {
-			JLOG_WARN("Failed to wrap SOCKS5 UDP header");
-			ret = -1;
-		} else {
-			ret = udp_sendto(conn_impl->sock, wrapped, (size_t)wrapped_len,
-			                 &agent->socks5->relay_addr);
-		}
-	} else {
-		ret = udp_sendto(conn_impl->sock, data, size, dst);
-	}
+	int ret = udp_sendto(&conn_impl->udp, data, size, dst);
 	if (ret < 0) {
 		ret = -sockerrno;
 		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
@@ -336,5 +303,11 @@ int conn_thread_send(juice_agent_t *agent, const addr_record_t *dst, const char 
 int conn_thread_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 
-	return udp_get_addrs(conn_impl->sock, records, size);
+	return udp_get_addrs(conn_impl->udp.sock, records, size);
+}
+
+int conn_thread_get_relay_addr(juice_agent_t *agent, addr_record_t *relay_addr) {
+	conn_impl_t *conn_impl = agent->conn_impl;
+
+	return udp_get_relay_addr(&conn_impl->udp, relay_addr);
 }

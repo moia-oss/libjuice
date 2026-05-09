@@ -27,12 +27,9 @@ int test_stun_unhandled_multiple(void);
 int test_stun_unhandled_no_host(void);
 int test_stun_unhandled_unhandle(void);
 int test_tcp(void);
-<<<<<<< HEAD
 int test_tcp_bad_candidate(void);
-=======
 int test_socks5(void);
 int test_socks5_connectivity(void);
->>>>>>> 76bdeba (add socks 5 support)
 
 #ifndef NO_SERVER
 int test_server(void);
@@ -121,14 +118,12 @@ int main(int argc, char **argv) {
 		return -2;
 	}
 
-<<<<<<< HEAD
 	printf("\nRunning TCP Bad Candidate test...\n");
 	if (test_tcp_bad_candidate()) {
 		fprintf(stderr, "TCP bad candidate test failed\n");
 		return -2;
 	}
 
-=======
 	printf("\nRunning SOCKS5 UDP header test...\n");
 	if (test_socks5()) {
 		fprintf(stderr, "SOCKS5 UDP header test failed\n");
@@ -142,7 +137,6 @@ int main(int argc, char **argv) {
 		return -1;
 	}
 #endif
->>>>>>> 76bdeba (add socks 5 support)
 
 #ifndef _WIN32
 	// windows fails to read STUN message from listen socket:

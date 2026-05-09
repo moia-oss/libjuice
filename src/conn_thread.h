@@ -28,5 +28,6 @@ int conn_thread_interrupt(juice_agent_t *agent);
 int conn_thread_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                      int ds);
 int conn_thread_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size);
+int conn_thread_get_relay_addr(juice_agent_t *agent, addr_record_t *relay_addr);
 
 #endif

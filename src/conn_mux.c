@@ -36,7 +36,7 @@ typedef struct registry_impl {
 	int conn_mux_registries_index;
 	uint16_t port;
 	thread_t thread;
-	socket_t sock;
+	udp_socket_context_t udp;
 	mutex_t send_mutex;
 	int send_ds;
 	map_entry_t *map;
@@ -213,8 +213,9 @@ static int grow_map(registry_impl_t *impl, int new_size) {
 	return 0;
 }
 
-int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t *next_timestamp);
-int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd);
+int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, int *nfds,
+                     timestamp_t *next_timestamp);
+int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd, int nfds);
 int conn_mux_recv(conn_registry_t *registry, char *buffer, size_t size, addr_record_t *src);
 void conn_mux_fail(conn_registry_t *registry);
 int conn_mux_run(conn_registry_t *registry);
@@ -243,15 +244,14 @@ int conn_mux_registry_init(conn_registry_t *registry, udp_socket_config_t *confi
 	registry_impl->map_size = INITIAL_MAP_SIZE;
 	registry_impl->map_count = 0;
 
-	registry_impl->sock = udp_create_socket(config);
-	if (registry_impl->sock == INVALID_SOCKET) {
+	if (udp_open(&registry_impl->udp, config) < 0) {
 		JLOG_FATAL("UDP socket creation failed");
 		free(registry_impl->map);
 		free(registry_impl);
 		return -1;
 	}
 
-	registry_impl->port = udp_get_port(registry_impl->sock);
+	registry_impl->port = udp_get_port(registry_impl->udp.sock);
 
 	mutex_init(&registry_impl->send_mutex, 0);
 	registry->impl = registry_impl;
@@ -274,7 +274,7 @@ int conn_mux_registry_init(conn_registry_t *registry, udp_socket_config_t *confi
 
 error:
 	mutex_destroy(&registry_impl->send_mutex);
-	closesocket(registry_impl->sock);
+	udp_close(&registry_impl->udp);
 	free(registry_impl->map);
 	free(registry_impl);
 	registry->impl = NULL;
@@ -298,20 +298,29 @@ void conn_mux_registry_cleanup(conn_registry_t *registry) {
 	--conn_mux_registries_count;
 
 	mutex_destroy(&registry_impl->send_mutex);
-	closesocket(registry_impl->sock);
+	udp_close(&registry_impl->udp);
 	free(registry_impl->map);
 	free(registry->impl);
 	registry->impl = NULL;
 }
 
-int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, timestamp_t *next_timestamp) {
+int conn_mux_prepare(conn_registry_t *registry, struct pollfd *pfd, int *nfds,
+                     timestamp_t *next_timestamp) {
 	timestamp_t now = current_timestamp();
 	*next_timestamp = now + 60000;
 
 	mutex_lock(&registry->mutex);
 	registry_impl_t *registry_impl = registry->impl;
-	pfd->fd = registry_impl->sock;
-	pfd->events = POLLIN;
+	pfd[0].fd = registry_impl->udp.sock;
+	pfd[0].events = POLLIN;
+	*nfds = 1;
+
+	socket_t control_sock = udp_get_control_socket(&registry_impl->udp);
+	if (control_sock != INVALID_SOCKET) {
+		pfd[1].fd = control_sock;
+		pfd[1].events = POLLIN;
+		*nfds = 2;
+	}
 
 	for (int i = 0; i < registry->agents_size; ++i) {
 		juice_agent_t *agent = registry->agents[i];
@@ -419,17 +428,35 @@ static juice_agent_t *lookup_agent(conn_registry_t *registry, char *buf, size_t 
 	return NULL;
 }
 
-int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd) {
+int conn_mux_process(conn_registry_t *registry, struct pollfd *pfd, int nfds) {
 	mutex_lock(&registry->mutex);
+	registry_impl_t *registry_impl = registry->impl;
 
-	if (pfd->revents & POLLNVAL || pfd->revents & POLLERR) {
+	if (nfds > 1 && udp_get_control_socket(&registry_impl->udp) != INVALID_SOCKET) {
+		if (pfd[1].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+			JLOG_WARN("SOCKS5 control connection lost");
+			conn_mux_fail(registry);
+			mutex_unlock(&registry->mutex);
+			return -1;
+		}
+		if (pfd[1].revents & POLLIN) {
+			if (!udp_is_proxy_alive(&registry_impl->udp)) {
+				JLOG_WARN("SOCKS5 control connection closed by proxy");
+				conn_mux_fail(registry);
+				mutex_unlock(&registry->mutex);
+				return -1;
+			}
+		}
+	}
+
+	if (pfd[0].revents & POLLNVAL || pfd[0].revents & POLLERR) {
 		JLOG_ERROR("Error when polling socket");
 		conn_mux_fail(registry);
 		mutex_unlock(&registry->mutex);
 		return -1;
 	}
 
-	if (pfd->revents & POLLIN) {
+	if (pfd[0].revents & POLLIN) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t src;
 		int left = 1000; // limit to ensure update is run and new agents are processed
@@ -490,8 +517,8 @@ int conn_mux_recv(conn_registry_t *registry, char *buffer, size_t size, addr_rec
 	JLOG_VERBOSE("Receiving datagram");
 	registry_impl_t *registry_impl = registry->impl;
 	int len;
-	while ((len = udp_recvfrom(registry_impl->sock, buffer, size, src)) == 0) {
-		// Empty datagram (used to interrupt)
+	while ((len = udp_recvfrom(&registry_impl->udp, buffer, size, src)) == 0) {
+		// Empty datagram (used to interrupt) or SOCKS5 unwrap failure
 	}
 
 	if (len < 0) {
@@ -519,15 +546,16 @@ void conn_mux_fail(conn_registry_t *registry) {
 }
 
 int conn_mux_run(conn_registry_t *registry) {
-	struct pollfd pfd[1];
+	struct pollfd pfd[2];
 	timestamp_t next_timestamp;
-	while (conn_mux_prepare(registry, pfd, &next_timestamp) > 0) {
+	int nfds;
+	while (conn_mux_prepare(registry, pfd, &nfds, &next_timestamp) > 0) {
 		timediff_t timediff = next_timestamp - current_timestamp();
 		if (timediff < 0)
 			timediff = 0;
 
 		JLOG_VERBOSE("Entering poll for %d ms", (int)timediff);
-		int ret = poll(pfd, 1, (int)timediff);
+		int ret = poll(pfd, (nfds_t)nfds, (int)timediff);
 		JLOG_VERBOSE("Leaving poll");
 		if (ret < 0) {
 			if (sockerrno == SEINTR || sockerrno == SEAGAIN) {
@@ -539,7 +567,7 @@ int conn_mux_run(conn_registry_t *registry) {
 			}
 		}
 
-		if (conn_mux_process(registry, pfd) < 0)
+		if (conn_mux_process(registry, pfd, nfds) < 0)
 			break;
 	}
 
@@ -594,7 +622,7 @@ int conn_mux_interrupt_registry(conn_registry_t *registry) {
 	registry_impl_t *registry_impl = registry->impl;
 	mutex_lock(&registry_impl->send_mutex);
 	char dummy = 0; // Some C libraries might error out on NULL pointers
-	if (udp_sendto_self(registry_impl->sock, &dummy, 0) < 0) {
+	if (udp_sendto_self(registry_impl->udp.sock, &dummy, 0) < 0) {
 		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
 			JLOG_WARN("Failed to interrupt poll by triggering socket, errno=%d", sockerrno);
 		}
@@ -625,7 +653,7 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 
 	if (registry_impl->send_ds >= 0 && registry_impl->send_ds != ds) {
 		JLOG_VERBOSE("Setting Differentiated Services field to 0x%X", ds);
-		if (udp_set_diffserv(registry_impl->sock, ds) == 0)
+		if (udp_set_diffserv(registry_impl->udp.sock, ds) == 0)
 			registry_impl->send_ds = ds;
 		else
 			registry_impl->send_ds = -1; // disable for next time
@@ -633,7 +661,7 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	int ret = udp_sendto(registry_impl->sock, data, size, dst);
+	int ret = udp_sendto(&registry_impl->udp, data, size, dst);
 	if (ret < 0) {
 		ret = -sockerrno;
 		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
@@ -652,7 +680,14 @@ int conn_mux_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size
 	conn_impl_t *conn_impl = agent->conn_impl;
 	registry_impl_t *registry_impl = conn_impl->registry->impl;
 
-	return udp_get_addrs(registry_impl->sock, records, size);
+	return udp_get_addrs(registry_impl->udp.sock, records, size);
+}
+
+int conn_mux_get_relay_addr(juice_agent_t *agent, addr_record_t *relay_addr) {
+	conn_impl_t *conn_impl = agent->conn_impl;
+	registry_impl_t *registry_impl = conn_impl->registry->impl;
+
+	return udp_get_relay_addr(&registry_impl->udp, relay_addr);
 }
 
 int conn_mux_stop_listen(conn_registry_t *registry) {
