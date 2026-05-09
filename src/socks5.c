@@ -442,6 +442,10 @@ bool socks5_is_alive(const socks5_context_t *ctx) {
 		return false;
 	}
 	// Got data (unexpected from proxy, but connection is alive)
+	// Drain it to avoid busy-looping on POLLIN
+	char drain[64];
+	while (recv(ctx->control_sock, drain, sizeof(drain), 0) > 0) {
+	}
 	return true;
 }
 
