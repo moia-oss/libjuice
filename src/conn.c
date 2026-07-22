@@ -119,6 +119,7 @@ static void release_registry(conn_mode_entry_t *entry, conn_registry_t *registry
 			entry->registry_cleanup_func(registry);
 
 		entry->registry = NULL;
+		mutex_destroy(&registry->mutex);
 		free(registry->agents);
 		free(registry);
 		return;
