@@ -97,7 +97,7 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 add_library(juice ${LIBJUICE_SOURCES})
-set_target_properties(juice PROPERTIES VERSION ${PROJECT_VERSION})
+set_target_properties(juice PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_include_directories(juice PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
