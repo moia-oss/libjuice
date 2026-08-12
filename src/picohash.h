@@ -27,6 +27,11 @@
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 #define _PICOHASH_BIG_ENDIAN
 #endif
+#elif defined(__QNX__) || defined(__QNXNTO__)
+/* QNX uses __LITTLEENDIAN__ or __BIGENDIAN__ macros */
+#ifdef __BIGENDIAN__
+#define _PICOHASH_BIG_ENDIAN
+#endif
 #else               // ! defined __LITTLE_ENDIAN__
 #include <endian.h> // machine/endian.h
 #if BYTE_ORDER == BIG_ENDIAN
