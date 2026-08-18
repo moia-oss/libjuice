@@ -31,7 +31,7 @@ class libjuiceConan(ConanFile):
     languages = "C"
     implements = ["auto_shared_fpic"]
 
-    exports_sources = "CMakeLists.txt", "src/*", "include/*", "LICENSE"
+    exports_sources = "CMakeLists.txt", "src/*", "include/*", "cmake/*", "LICENSE"
 
     def layout(self):
         cmake_layout(self)
