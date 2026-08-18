@@ -487,15 +487,14 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 		conn_poll_process_udp(agent, udp_pfd);
 		i++;
 
-		if (conn_impl->tcp_sock == INVALID_SOCKET)
-			continue;
+		if (conn_impl->tcp_sock != INVALID_SOCKET) {
+			struct pollfd *tcp_pfd = pfds->pfds + i;
+			if (tcp_pfd->fd != conn_impl->tcp_sock)
+				break;
 
-		struct pollfd *tcp_pfd = pfds->pfds + i;
-		if (tcp_pfd->fd != conn_impl->tcp_sock)
-			break;
-
-		conn_poll_process_tcp(agent, tcp_pfd);
-		i++;
+			conn_poll_process_tcp(agent, tcp_pfd);
+			i++;
+		}
 
 		// Check SOCKS5 control socket for disconnect
 		socket_t control_sock = udp_get_control_socket(&conn_impl->udp);
