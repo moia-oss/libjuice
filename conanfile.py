@@ -11,7 +11,7 @@ required_conan_version = ">=2.4"
 
 class libjuiceConan(ConanFile):
     name = "libjuice"
-    version = "1.6.1"
+    version = "1.7.1-moia.0.1"
     description = "JUICE is a UDP Interactive Connectivity Establishment library."
     license = "MPL-2.0"
     topics = ("webrtc", "ice")
