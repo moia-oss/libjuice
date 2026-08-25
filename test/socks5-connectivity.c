@@ -42,14 +42,41 @@ static void on_gathering_done2(juice_agent_t *agent, void *user_ptr);
 static void on_recv1(juice_agent_t *agent, const char *data, size_t size, void *user_ptr);
 static void on_recv2(juice_agent_t *agent, const char *data, size_t size, void *user_ptr);
 
-int test_socks5_connectivity(void) {
+typedef enum {
+	CANDIDATE_TYPE_HOST,
+	CANDIDATE_TYPE_SRFLX,
+	CANDIDATE_TYPE_RELAY,
+} candidate_type_t;
+
+static int run_socks5_connectivity_test(candidate_type_t candidate_type) {
+
 	juice_set_log_level(JUICE_LOG_LEVEL_DEBUG);
+
+	received1 = false;
+	received2 = false;
+	juice_server_t *server = NULL;
+	uint16_t server_port = 0;
+
+	if (candidate_type == CANDIDATE_TYPE_SRFLX || candidate_type == CANDIDATE_TYPE_RELAY) {
+		juice_server_credentials_t credentials = {"user", "pass", 2};
+		juice_server_config_t server_config;
+		memset(&server_config, 0, sizeof(server_config));
+		server_config.bind_address = "127.0.0.1";
+		server_config.credentials = &credentials;
+		server_config.credentials_count = 1;
+		server_config.max_allocations = 10;
+		server_config.max_peers = 10;
+
+		server = juice_server_create(&server_config);
+		server_port = juice_server_get_port(server);
+	}
 
 	// Start the SOCKS5 proxy
 	socks5_proxy_config_t config = {NULL, NULL};
 	socks5_proxy_t *proxy = socks5_proxy_start(&config);
 
 	// SOCKS5 proxy config
+	// TODO: can we re-use the following config?
 	juice_socks5_proxy_t socks5_proxy;
 	memset(&socks5_proxy, 0, sizeof(socks5_proxy));
 	socks5_proxy.host = "127.0.0.1";
@@ -58,6 +85,26 @@ int test_socks5_connectivity(void) {
 	// Agent 1: Create agent with SOCKS5 proxy
 	juice_config_t config1;
 	memset(&config1, 0, sizeof(config1));
+	juice_turn_server_t turn_server;
+
+	switch (candidate_type) {
+	case CANDIDATE_TYPE_HOST:
+		break;
+	case CANDIDATE_TYPE_SRFLX:
+		config1.stun_server_host = "127.0.0.1";
+		config1.stun_server_port = server_port;
+		break;
+	case CANDIDATE_TYPE_RELAY: {
+		memset(&turn_server, 0, sizeof(turn_server));
+		turn_server.host = "127.0.0.1";
+		turn_server.port = server_port;
+		turn_server.username = "user";
+		turn_server.password = "pass";
+		config1.turn_servers = &turn_server;
+		config1.turn_servers_count = 1;
+		break;
+	}
+	}
 	config1.bind_address = "127.0.0.1";
 	config1.socks5_proxy = &socks5_proxy;
 	config1.cb_state_changed = on_state_changed1;
@@ -178,17 +225,24 @@ int test_socks5_connectivity(void) {
 	}
 
 	// Cleanup
+	if (server) {
+		juice_server_destroy(server);
+	}
 	juice_destroy(agent1);
 	juice_destroy(agent2);
 	socks5_proxy_stop(proxy);
 
-	if (success) {
-		printf("Success\n");
-		return 0;
-	} else {
+	return success ? 0 : -1;
+}
+int test_socks5_connectivity(void) {
+	if (run_socks5_connectivity_test(CANDIDATE_TYPE_HOST) ||
+	    run_socks5_connectivity_test(CANDIDATE_TYPE_SRFLX) ||
+	    run_socks5_connectivity_test(CANDIDATE_TYPE_RELAY)) {
 		printf("Failure\n");
 		return -1;
 	}
+	printf("Success\n");
+	return 0;
 }
 
 static void on_state_changed1(juice_agent_t *agent, juice_state_t state, void *user_ptr) {
