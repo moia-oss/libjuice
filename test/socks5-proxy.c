@@ -34,13 +34,14 @@ struct socks5_proxy {
 
 static void *socks5_proxy_thread(void *arg) {
 	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
+	int client_sockfd = -1;
+	int udp_sockfd = -1;
 
-	// Create client socket
+	// Accept client connection
 	struct sockaddr_in client_addr;
 	memset(&client_addr, 0, sizeof(client_addr));
 	socklen_t addr_len = sizeof(client_addr);
 
-	int client_sockfd;
 	while (atomic_load(&proxy->running)) {
 		struct pollfd pfd = {.fd = proxy->tcp_fd, .events = POLLIN};
 
@@ -49,12 +50,12 @@ static void *socks5_proxy_thread(void *arg) {
 
 		if ((client_sockfd = accept(proxy->tcp_fd, (struct sockaddr *)&client_addr, &addr_len)) ==
 		    -1) {
-			return NULL;
+			goto cleanup;
 		}
 		break;
 	}
 	if (!atomic_load(&proxy->running))
-		return NULL;
+		goto cleanup;
 
 	// Conduct greeting phase and detect auth method from greeting message (currently only no auth
 	// supported)
@@ -64,12 +65,9 @@ static void *socks5_proxy_thread(void *arg) {
 
 	n = recv(client_sockfd, greeting, sizeof(greeting), 0);
 
-	// only handle SOCKS 5 and abort otherwise
-	if (n < 3 || greeting[0] != SOCKS5_VERSION) {
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		return NULL;
-	}
+	if (n < 3 || greeting[0] != SOCKS5_VERSION)
+		goto cleanup;
+
 	for (int i = 0; i < greeting[1]; i++) {
 		if (greeting[2 + i] == SOCKS5_AUTH_NONE) {
 			supports_noauth = true;
@@ -82,15 +80,12 @@ static void *socks5_proxy_thread(void *arg) {
 	// Conduct request phase
 	uint8_t request[512];
 	n = recv(client_sockfd, request, sizeof(request), 0);
-	uint8_t ver = request[0];  // should be 0x05
-	uint8_t cmd = request[1];  // 0x01=CONNECT, 0x02=BIND, 0x03=UDP ASSOCIATE
-	uint8_t atyp = request[3]; // address type
+	uint8_t ver = request[0];
+	uint8_t cmd = request[1];
+	uint8_t atyp = request[3];
 
-	if (ver != SOCKS5_VERSION) {
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		return NULL;
-	}
+	if (ver != SOCKS5_VERSION)
+		goto cleanup;
 
 	if (cmd != SOCKS5_CMD_UDP_ASSOCIATE) {
 		uint8_t reply[] = {SOCKS5_VERSION,
@@ -104,9 +99,7 @@ static void *socks5_proxy_thread(void *arg) {
 		                   0,
 		                   0};
 		send(client_sockfd, reply, sizeof(reply), 0);
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		return NULL;
+		goto cleanup;
 	}
 
 	// Parse address based on atyp
@@ -115,19 +108,13 @@ static void *socks5_proxy_thread(void *arg) {
 	client_udp_addr.sin_family = AF_INET;
 
 	switch (atyp) {
-
 	case SOCKS5_ATYP_IPV4:
 		memcpy(&client_udp_addr.sin_addr, &request[4], 4);
 		memcpy(&client_udp_addr.sin_port, &request[8], 2);
 		break;
 	case SOCKS5_ATYP_IPV6:
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		return NULL;
 	case SOCKS5_ATYP_DOMAIN:
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		return NULL;
+		goto cleanup;
 	default: {
 		uint8_t reply[] = {SOCKS5_VERSION,
 		                   SOCKS5_REP_ADDRESS_TYPE_NOT_SUPPORTED,
@@ -140,19 +127,15 @@ static void *socks5_proxy_thread(void *arg) {
 		                   0,
 		                   0};
 		send(client_sockfd, reply, sizeof(reply), 0);
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		return NULL;
+		goto cleanup;
 	}
 	}
 
 	// Create UDP socket
-	int udp_sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	udp_sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (udp_sockfd == -1) {
 		perror("udp_socket");
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		return NULL;
+		goto cleanup;
 	}
 
 	// Bind to any port
@@ -164,10 +147,7 @@ static void *socks5_proxy_thread(void *arg) {
 
 	if (bind(udp_sockfd, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) == -1) {
 		perror("udp bind");
-		close(client_sockfd);
-		close(proxy->tcp_fd);
-		close(udp_sockfd);
-		return NULL;
+		goto cleanup;
 	}
 
 	// Get ip address and port and store it
@@ -184,7 +164,7 @@ static void *socks5_proxy_thread(void *arg) {
 	memcpy(&reply[8], &udp_addr.sin_port, 2);
 	send(client_sockfd, reply, sizeof(reply), 0);
 
-	// Set up UDP
+	// UDP relay loop
 	uint8_t buffer[MAX_DATAGRAM_SIZE];
 	struct sockaddr_in sender_addr;
 	socklen_t sender_len = sizeof(sender_addr);
@@ -200,9 +180,8 @@ static void *socks5_proxy_thread(void *arg) {
 		if (recv_len < 0)
 			break;
 		if (recv_len < 10)
-			continue; // too short to contain SOCKS5 UDP header
+			continue;
 
-		// Client didn't know its IP and port initially
 		if (client_udp_addr.sin_port == 0) {
 			client_udp_addr = sender_addr;
 		}
@@ -211,7 +190,6 @@ static void *socks5_proxy_thread(void *arg) {
 		memset(&dest_addr, 0, sizeof(dest_addr));
 		dest_addr.sin_family = AF_INET;
 
-		// Check if sender is local client or remote destination
 		if (sender_addr.sin_addr.s_addr == client_udp_addr.sin_addr.s_addr &&
 		    sender_addr.sin_port == client_udp_addr.sin_port) {
 
@@ -232,9 +210,13 @@ static void *socks5_proxy_thread(void *arg) {
 			       sizeof(client_udp_addr));
 		}
 	}
+
+cleanup:
 	close(proxy->tcp_fd);
-	close(client_sockfd);
-	close(udp_sockfd);
+	if (client_sockfd != -1)
+		close(client_sockfd);
+	if (udp_sockfd != -1)
+		close(udp_sockfd);
 	return NULL;
 }
 
