@@ -32,15 +32,7 @@ struct socks5_proxy {
 	uint16_t port;
 };
 
-static void *socks5_proxy_thread(void *arg) {
-	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
-	int client_sockfd = -1;
-	int udp_sockfd = -1;
-
-	// Accept client connection
-	struct sockaddr_in client_addr;
-	memset(&client_addr, 0, sizeof(client_addr));
-	socklen_t addr_len = sizeof(client_addr);
+static int accept_connection(socks5_proxy_t *proxy) {
 
 	while (atomic_load(&proxy->running)) {
 		struct pollfd pfd = {.fd = proxy->tcp_fd, .events = POLLIN};
@@ -48,14 +40,20 @@ static void *socks5_proxy_thread(void *arg) {
 		if (poll(&pfd, 1, 100) <= 0)
 			continue;
 
-		if ((client_sockfd = accept(proxy->tcp_fd, (struct sockaddr *)&client_addr, &addr_len)) ==
-		    -1) {
-			goto cleanup;
-		}
-		break;
+		return accept(proxy->tcp_fd, NULL, NULL);
 	}
-	if (!atomic_load(&proxy->running))
+
+	return -1;
+}
+
+static void *socks5_proxy_thread(void *arg) {
+	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
+	int client_sockfd = -1;
+	int udp_sockfd = -1;
+
+	if ((client_sockfd = accept_connection(proxy)) == -1) {
 		goto cleanup;
+	}
 
 	// Conduct greeting phase and detect auth method from greeting message (currently only no auth
 	// supported)
