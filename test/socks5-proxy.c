@@ -11,16 +11,19 @@
 #include <unistd.h>
 
 #define TCP_BACKLOG_SIZE 10
-#define SOCKS_5 0x05
-#define NO_AUTH 0x00
-#define UDP_ASSOCIATE 0x03
 #define MAX_DATAGRAM_SIZE 65535
 
-int test_socks5_proxy(void) {
-	socks5_proxy_config_t config;
-	socks5_proxy_start(&config);
-	return 0;
-}
+#define SOCKS5_VERSION 0x05
+#define SOCKS5_AUTH_NONE 0x00
+#define SOCKS5_CMD_UDP_ASSOCIATE 0x03
+
+#define SOCKS5_ATYP_IPV4 0x01
+#define SOCKS5_ATYP_DOMAIN 0x03
+#define SOCKS5_ATYP_IPV6 0x04
+
+#define SOCKS5_REP_SUCCESS 0x00
+#define SOCKS5_REP_COMMAND_NOT_SUPPORTED 0x07
+#define SOCKS5_REP_ADDRESS_TYPE_NOT_SUPPORTED 0x08
 
 struct socks5_proxy {
 	pthread_t thread;
@@ -62,36 +65,44 @@ static void *socks5_proxy_thread(void *arg) {
 	n = recv(client_sockfd, greeting, sizeof(greeting), 0);
 
 	// only handle SOCKS 5 and abort otherwise
-	if (n < 3 || greeting[0] != SOCKS_5) {
+	if (n < 3 || greeting[0] != SOCKS5_VERSION) {
 		close(client_sockfd);
 		close(proxy->tcp_fd);
 		return NULL;
 	}
 	for (int i = 0; i < greeting[1]; i++) {
-		if (greeting[2 + i] == NO_AUTH) {
+		if (greeting[2 + i] == SOCKS5_AUTH_NONE) {
 			supports_noauth = true;
 			break;
 		}
 	}
-	uint8_t response[2] = {SOCKS_5, supports_noauth ? NO_AUTH : 0xFF};
+	uint8_t response[2] = {SOCKS5_VERSION, supports_noauth ? SOCKS5_AUTH_NONE : 0xFF};
 	send(client_sockfd, response, 2, 0);
 
-	// Conduct
+	// Conduct request phase
 	uint8_t request[512];
 	n = recv(client_sockfd, request, sizeof(request), 0);
 	uint8_t ver = request[0];  // should be 0x05
 	uint8_t cmd = request[1];  // 0x01=CONNECT, 0x02=BIND, 0x03=UDP ASSOCIATE
 	uint8_t atyp = request[3]; // address type
 
-	if (ver != SOCKS_5) {
+	if (ver != SOCKS5_VERSION) {
 		close(client_sockfd);
 		close(proxy->tcp_fd);
 		return NULL;
 	}
 
-	if (cmd != UDP_ASSOCIATE) {
-		uint8_t reply[] = {0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-		//                  ver   rep   rsv   atyp  addr     port
+	if (cmd != SOCKS5_CMD_UDP_ASSOCIATE) {
+		uint8_t reply[] = {SOCKS5_VERSION,
+		                   SOCKS5_REP_COMMAND_NOT_SUPPORTED,
+		                   0x00,
+		                   SOCKS5_ATYP_IPV4,
+		                   0,
+		                   0,
+		                   0,
+		                   0,
+		                   0,
+		                   0};
 		send(client_sockfd, reply, sizeof(reply), 0);
 		close(client_sockfd);
 		close(proxy->tcp_fd);
@@ -105,25 +116,30 @@ static void *socks5_proxy_thread(void *arg) {
 
 	switch (atyp) {
 
-	case 0x01: // IPv4
+	case SOCKS5_ATYP_IPV4:
 		memcpy(&client_udp_addr.sin_addr, &request[4], 4);
 		memcpy(&client_udp_addr.sin_port, &request[8], 2);
 		break;
-	case 0x04: // IPv6
+	case SOCKS5_ATYP_IPV6:
 		close(client_sockfd);
 		close(proxy->tcp_fd);
 		return NULL;
-		break;
-	case 0x03: // domain
-		// would need DNS resolution — skip for a test proxy
+	case SOCKS5_ATYP_DOMAIN:
 		close(client_sockfd);
 		close(proxy->tcp_fd);
 		return NULL;
-		break;
 	default: {
-		// unknown address type
-		uint8_t reply[] = {0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
-		send(client_sockfd, reply, sizeof(reply), 0); // 0x08 = address type not supported
+		uint8_t reply[] = {SOCKS5_VERSION,
+		                   SOCKS5_REP_ADDRESS_TYPE_NOT_SUPPORTED,
+		                   0x00,
+		                   SOCKS5_ATYP_IPV4,
+		                   0,
+		                   0,
+		                   0,
+		                   0,
+		                   0,
+		                   0};
+		send(client_sockfd, reply, sizeof(reply), 0);
 		close(client_sockfd);
 		close(proxy->tcp_fd);
 		return NULL;
@@ -160,10 +176,10 @@ static void *socks5_proxy_thread(void *arg) {
 
 	// Send UDP socket info to client
 	uint8_t reply[10];
-	reply[0] = SOCKS_5;
-	reply[1] = 0x00; // success
-	reply[2] = 0x00; // rsv // TODO: what does that mean?
-	reply[3] = 0x01; // atyp: IPv4
+	reply[0] = SOCKS5_VERSION;
+	reply[1] = SOCKS5_REP_SUCCESS;
+	reply[2] = 0x00; // reserved
+	reply[3] = SOCKS5_ATYP_IPV4;
 	memcpy(&reply[4], &udp_addr.sin_addr, 4);
 	memcpy(&reply[8], &udp_addr.sin_port, 2);
 	send(client_sockfd, reply, sizeof(reply), 0);
@@ -208,7 +224,7 @@ static void *socks5_proxy_thread(void *arg) {
 			wrapped[0] = 0x00; // RSV
 			wrapped[1] = 0x00; // RSV
 			wrapped[2] = 0x00; // FRAG
-			wrapped[3] = 0x01; // ATYP: IPv4
+			wrapped[3] = SOCKS5_ATYP_IPV4;
 			memcpy(&wrapped[4], &sender_addr.sin_addr, 4);
 			memcpy(&wrapped[8], &sender_addr.sin_port, 2);
 			memcpy(&wrapped[10], buffer, recv_len);

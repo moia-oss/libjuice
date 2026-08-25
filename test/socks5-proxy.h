@@ -12,7 +12,6 @@ typedef struct socks5_proxy_config {
 
 typedef struct socks5_proxy socks5_proxy_t;
 
-int test_socks5_proxy(void);
 socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config);
 uint16_t socks5_proxy_get_port(socks5_proxy_t *proxy);
 void socks5_proxy_stop(socks5_proxy_t *proxy);
