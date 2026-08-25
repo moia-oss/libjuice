@@ -130,13 +130,11 @@ int main(int argc, char **argv) {
 		return -2;
 	}
 
-#ifndef _WIN32
 	printf("\nRunning SOCKS5 connectivity test...\n");
 	if (test_socks5_connectivity()) {
 		fprintf(stderr, "SOCKS5 connectivity test failed\n");
 		return -1;
 	}
-#endif
 
 #ifndef _WIN32
 	// windows fails to read STUN message from listen socket:
