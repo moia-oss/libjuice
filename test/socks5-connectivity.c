@@ -7,6 +7,7 @@
  */
 
 #include "juice/juice.h"
+#include "socks5-proxy.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,25 +20,12 @@
 static void sleep(unsigned int secs) { Sleep(secs * 1000); }
 static void usleep(unsigned int usecs) { Sleep(usecs / 1000); }
 #else
-#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
 
-// For checking if port is open
-#include <errno.h>
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#endif
-
 #define BUFFER_SIZE 4096
-#define SOCKS5_PORT 18555
 
 static juice_agent_t *agent1;
 static juice_agent_t *agent2;
@@ -54,132 +42,18 @@ static void on_gathering_done2(juice_agent_t *agent, void *user_ptr);
 static void on_recv1(juice_agent_t *agent, const char *data, size_t size, void *user_ptr);
 static void on_recv2(juice_agent_t *agent, const char *data, size_t size, void *user_ptr);
 
-#ifndef _WIN32
-static pid_t proxy_pid = -1;
-#endif
-
-// Wait for a TCP port to become available
-static bool wait_for_port(uint16_t port, int timeout_ms) {
-	int elapsed = 0;
-	while (elapsed < timeout_ms) {
-		int sock = socket(AF_INET, SOCK_STREAM, 0);
-		if (sock < 0)
-			return false;
-
-		struct sockaddr_in addr;
-		memset(&addr, 0, sizeof(addr));
-		addr.sin_family = AF_INET;
-		addr.sin_port = htons(port);
-		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-		int ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-#ifdef _WIN32
-		closesocket(sock);
-#else
-		close(sock);
-#endif
-		if (ret == 0)
-			return true;
-
-		usleep(100000); // 100ms
-		elapsed += 100;
-	}
-	return false;
-}
-
-static char config_path[256] = {0};
-
-static int write_danted_config(void) {
-	snprintf(config_path, sizeof(config_path), "/tmp/libjuice-test-danted-%d.conf", (int)getpid());
-	FILE *f = fopen(config_path, "w");
-	if (!f) {
-		perror("fopen config");
-		return -1;
-	}
-	fprintf(f,
-		"logoutput: stderr\n"
-		"internal: 127.0.0.1 port = %d\n"
-		"external: 127.0.0.1\n"
-		"socksmethod: none\n"
-		"client pass {\n"
-		"  from: 127.0.0.0/8 to: 0.0.0.0/0\n"
-		"}\n"
-		"socks pass {\n"
-		"  from: 127.0.0.0/8 to: 0.0.0.0/0\n"
-		"  protocol: tcp udp\n"
-		"  command: connect udpassociate udpreply\n"
-		"}\n",
-		SOCKS5_PORT);
-	fclose(f);
-	return 0;
-}
-
-static int start_socks5_proxy(void) {
-#ifdef _WIN32
-	fprintf(stderr, "SOCKS5 connectivity test not supported on Windows\n");
-	return -1;
-#else
-	if (write_danted_config() < 0)
-		return -1;
-
-	proxy_pid = fork();
-	if (proxy_pid < 0) {
-		perror("fork");
-		unlink(config_path);
-		return -1;
-	}
-
-	if (proxy_pid == 0) {
-		// Child: exec danted
-		execlp("sockd", "sockd", "-f", config_path, NULL);
-		perror("execlp sockd");
-		_exit(1);
-	}
-
-	// Parent: wait for proxy to be ready
-	printf("Starting SOCKS5 proxy (sockd) on port %d (pid %d)...\n", SOCKS5_PORT, proxy_pid);
-	if (!wait_for_port(SOCKS5_PORT, 5000)) {
-		fprintf(stderr, "SOCKS5 proxy failed to start within 5 seconds\n");
-		kill(proxy_pid, SIGTERM);
-		waitpid(proxy_pid, NULL, 0);
-		proxy_pid = -1;
-		unlink(config_path);
-		return -1;
-	}
-
-	printf("SOCKS5 proxy is ready\n");
-	return 0;
-#endif
-}
-
-static void stop_socks5_proxy(void) {
-#ifndef _WIN32
-	if (proxy_pid > 0) {
-		printf("Stopping SOCKS5 proxy (pid %d)...\n", proxy_pid);
-		kill(proxy_pid, SIGTERM);
-		waitpid(proxy_pid, NULL, 0);
-		proxy_pid = -1;
-	}
-	if (config_path[0])
-		unlink(config_path);
-#endif
-}
-
 int test_socks5_connectivity(void) {
 	juice_set_log_level(JUICE_LOG_LEVEL_DEBUG);
 
 	// Start the SOCKS5 proxy
-	if (start_socks5_proxy() < 0) {
-		printf("Skipping (sockd/dante not available)\n");
-		printf("Success\n");
-		return 0;
-	}
+	socks5_proxy_config_t config = {NULL, NULL};
+	socks5_proxy_t *proxy = socks5_proxy_start(&config);
 
 	// SOCKS5 proxy config
 	juice_socks5_proxy_t socks5_proxy;
 	memset(&socks5_proxy, 0, sizeof(socks5_proxy));
 	socks5_proxy.host = "127.0.0.1";
-	socks5_proxy.port = SOCKS5_PORT;
+	socks5_proxy.port = socks5_proxy_get_port(proxy);
 
 	// Agent 1: Create agent with SOCKS5 proxy
 	juice_config_t config1;
@@ -195,7 +69,7 @@ int test_socks5_connectivity(void) {
 	agent1 = juice_create(&config1);
 	if (!agent1) {
 		fprintf(stderr, "Failed to create agent 1\n");
-		stop_socks5_proxy();
+		socks5_proxy_stop(proxy);
 		return -1;
 	}
 
@@ -215,7 +89,7 @@ int test_socks5_connectivity(void) {
 	if (!agent2) {
 		fprintf(stderr, "Failed to create agent 2\n");
 		juice_destroy(agent1);
-		stop_socks5_proxy();
+		socks5_proxy_stop(proxy);
 		return -1;
 	}
 
@@ -281,13 +155,13 @@ int test_socks5_connectivity(void) {
 
 		char localAddr[JUICE_MAX_ADDRESS_STRING_LEN];
 		char remoteAddr[JUICE_MAX_ADDRESS_STRING_LEN];
-		if (juice_get_selected_addresses(agent1, localAddr, JUICE_MAX_ADDRESS_STRING_LEN, remoteAddr,
-		                                 JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
+		if (juice_get_selected_addresses(agent1, localAddr, JUICE_MAX_ADDRESS_STRING_LEN,
+		                                 remoteAddr, JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
 			printf("Local address  1: %s\n", localAddr);
 			printf("Remote address 1: %s\n", remoteAddr);
 		}
-		if (juice_get_selected_addresses(agent2, localAddr, JUICE_MAX_ADDRESS_STRING_LEN, remoteAddr,
-		                                 JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
+		if (juice_get_selected_addresses(agent2, localAddr, JUICE_MAX_ADDRESS_STRING_LEN,
+		                                 remoteAddr, JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
 			printf("Local address  2: %s\n", localAddr);
 			printf("Remote address 2: %s\n", remoteAddr);
 		}
@@ -306,7 +180,7 @@ int test_socks5_connectivity(void) {
 	// Cleanup
 	juice_destroy(agent1);
 	juice_destroy(agent2);
-	stop_socks5_proxy();
+	socks5_proxy_stop(proxy);
 
 	if (success) {
 		printf("Success\n");
