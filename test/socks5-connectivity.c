@@ -74,6 +74,11 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
 
 	// Start the SOCKS5 proxy
 	socks5_proxy_t *proxy = socks5_proxy_start(proxy_config);
+	if (!proxy) {
+		fprintf(stderr, "Failed to create the socks proxy\n");
+		socks5_proxy_stop(proxy);
+		return -1;
+	}
 
 	// SOCKS5 proxy config
 	juice_socks5_proxy_t socks5_proxy;
