@@ -14,22 +14,31 @@
 #define MAX_DATAGRAM_SIZE 65535
 
 #define SOCKS5_VERSION 0x05
+
 #define SOCKS5_AUTH_NONE 0x00
-#define SOCKS5_CMD_UDP_ASSOCIATE 0x03
+#define SOCKS5_AUTH_USERPASS 0x02
+#define SOCKS5_AUTH_NO_ACCEPTABLE 0xFF
 
 #define SOCKS5_ATYP_IPV4 0x01
 #define SOCKS5_ATYP_DOMAIN 0x03
 #define SOCKS5_ATYP_IPV6 0x04
 
+#define SOCKS5_CMD_UDP_ASSOCIATE 0x03
+
 #define SOCKS5_REP_SUCCESS 0x00
 #define SOCKS5_REP_COMMAND_NOT_SUPPORTED 0x07
 #define SOCKS5_REP_ADDRESS_TYPE_NOT_SUPPORTED 0x08
+
+#define SOCKS5_USERPASS_VERSION 0x01
+#define SOCKS5_USERPASS_SUCCESS 0x00
+#define SOCKS5_USERPASS_FAILURE 0x01
 
 struct socks5_proxy {
 	pthread_t thread;
 	atomic_bool running;
 	int tcp_fd;
 	uint16_t port;
+	socks5_proxy_config_t *config;
 };
 
 static int socks5_accept_connection(socks5_proxy_t *proxy) {
@@ -46,7 +55,7 @@ static int socks5_accept_connection(socks5_proxy_t *proxy) {
 	return -1;
 }
 
-static int socks5_handle_greeting(int conn_fd) {
+static int socks5_handle_greeting(int conn_fd, socks5_proxy_config_t *proxy_config) {
 
 	uint8_t greeting[256];
 	ssize_t recv_len;
@@ -59,15 +68,47 @@ static int socks5_handle_greeting(int conn_fd) {
 	}
 
 	for (int i = 0; i < greeting[1]; i++) {
-		if (greeting[2 + i] == SOCKS5_AUTH_NONE) {
-			supports_noauth = true;
-			break;
+		if (proxy_config->username != NULL && proxy_config->password != NULL) {
+			if (greeting[2 + i] == SOCKS5_AUTH_USERPASS) {
+				uint8_t response[2] = {SOCKS5_VERSION, SOCKS5_AUTH_USERPASS};
+				send(conn_fd, response, 2, 0);
+				return 0;
+			}
+		} else if (greeting[2 + i] == SOCKS5_AUTH_NONE) {
+			uint8_t response[2] = {SOCKS5_VERSION, SOCKS5_AUTH_NONE};
+			send(conn_fd, response, 2, 0);
+			return 0;
 		}
 	}
-	uint8_t response[2] = {SOCKS5_VERSION, supports_noauth ? SOCKS5_AUTH_NONE : 0xFF};
+	uint8_t response[2] = {SOCKS5_VERSION, SOCKS5_AUTH_NO_ACCEPTABLE};
 	send(conn_fd, response, 2, 0);
 
-	return 0;
+	return -1;
+}
+
+static int socks5_handle_auth(int conn_fd, socks5_proxy_config_t *proxy_config) {
+	uint8_t buffer[512];
+	ssize_t buffer_len = recv(conn_fd, buffer, sizeof(buffer), 0);
+	if (buffer_len < 3) {
+		return -1;
+	}
+
+	uint8_t ulen = buffer[1];
+	uint8_t plen = buffer[2 + ulen];
+
+	if ((ulen == strlen(proxy_config->username)) &&
+	    (memcmp(&buffer[2], proxy_config->username, ulen) == 0) &&
+	    (plen == strlen(proxy_config->password)) &&
+	    (memcmp(&buffer[3 + ulen], proxy_config->password, plen) == 0)) {
+
+		uint8_t reply[] = {SOCKS5_USERPASS_VERSION, SOCKS5_USERPASS_SUCCESS};
+		send(conn_fd, reply, sizeof(reply), 0);
+		return 0;
+	} else {
+		uint8_t reply[] = {SOCKS5_USERPASS_VERSION, SOCKS5_USERPASS_FAILURE};
+		send(conn_fd, reply, sizeof(reply), 0);
+		return -1;
+	}
 }
 
 static int socks5_handle_udp_associate(int conn_fd, struct sockaddr_in *client_udp_addr) {
@@ -219,8 +260,8 @@ static void socks5_relay_udp(socks5_proxy_t *proxy, int udp_fd,
 	}
 }
 
-static void *socks5_proxy_thread(void *arg) {
-	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
+static void *socks5_proxy_thread(void *proxy_arg) {
+	socks5_proxy_t *proxy = (socks5_proxy_t *)proxy_arg;
 	int conn_fd = -1;
 	int udp_fd = -1;
 
@@ -228,8 +269,14 @@ static void *socks5_proxy_thread(void *arg) {
 		goto cleanup;
 	}
 
-	if (socks5_handle_greeting(conn_fd) == -1) {
+	if (socks5_handle_greeting(conn_fd, proxy->config) == -1) {
 		goto cleanup;
+	}
+
+	if (proxy->config->username != NULL && proxy->config->username != NULL) {
+		if (socks5_handle_auth(conn_fd, proxy->config) == -1) {
+			goto cleanup;
+		}
 	}
 
 	struct sockaddr_in client_udp_addr;
@@ -257,6 +304,7 @@ cleanup:
 socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 
 	socks5_proxy_t *proxy = malloc(sizeof(socks5_proxy_t));
+	proxy->config = config;
 	atomic_store(&proxy->running, true);
 
 	// Create TCP socket

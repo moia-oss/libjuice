@@ -48,7 +48,8 @@ typedef enum {
 	CANDIDATE_TYPE_RELAY,
 } candidate_type_t;
 
-static int run_socks5_connectivity_test(candidate_type_t candidate_type) {
+static int run_socks5_connectivity_test(candidate_type_t candidate_type,
+                                        socks5_proxy_config_t *proxy_config) {
 
 	juice_set_log_level(JUICE_LOG_LEVEL_DEBUG);
 
@@ -72,15 +73,15 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type) {
 	}
 
 	// Start the SOCKS5 proxy
-	socks5_proxy_config_t config = {NULL, NULL};
-	socks5_proxy_t *proxy = socks5_proxy_start(&config);
+	socks5_proxy_t *proxy = socks5_proxy_start(proxy_config);
 
 	// SOCKS5 proxy config
-	// TODO: can we re-use the following config?
 	juice_socks5_proxy_t socks5_proxy;
 	memset(&socks5_proxy, 0, sizeof(socks5_proxy));
 	socks5_proxy.host = "127.0.0.1";
 	socks5_proxy.port = socks5_proxy_get_port(proxy);
+	socks5_proxy.username = proxy_config->username;
+	socks5_proxy.password = proxy_config->password;
 
 	// Agent 1: Create agent with SOCKS5 proxy
 	juice_config_t config1;
@@ -235,9 +236,13 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type) {
 	return success ? 0 : -1;
 }
 int test_socks5_connectivity(void) {
-	if (run_socks5_connectivity_test(CANDIDATE_TYPE_HOST) ||
-	    run_socks5_connectivity_test(CANDIDATE_TYPE_SRFLX) ||
-	    run_socks5_connectivity_test(CANDIDATE_TYPE_RELAY)) {
+
+	socks5_proxy_config_t noauth = {NULL, NULL};
+	socks5_proxy_config_t auth = {"user", "pass"};
+	if (run_socks5_connectivity_test(CANDIDATE_TYPE_HOST, &noauth) ||
+	    run_socks5_connectivity_test(CANDIDATE_TYPE_SRFLX, &noauth) ||
+	    run_socks5_connectivity_test(CANDIDATE_TYPE_RELAY, &noauth) ||
+	    run_socks5_connectivity_test(CANDIDATE_TYPE_HOST, &auth)) {
 		printf("Failure\n");
 		return -1;
 	}
