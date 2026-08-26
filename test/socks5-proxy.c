@@ -32,7 +32,7 @@ struct socks5_proxy {
 	uint16_t port;
 };
 
-static int accept_connection(socks5_proxy_t *proxy) {
+static int socks5_accept_connection(socks5_proxy_t *proxy) {
 
 	while (atomic_load(&proxy->running)) {
 		struct pollfd pfd = {.fd = proxy->tcp_fd, .events = POLLIN};
@@ -46,25 +46,17 @@ static int accept_connection(socks5_proxy_t *proxy) {
 	return -1;
 }
 
-static void *socks5_proxy_thread(void *arg) {
-	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
-	int client_sockfd = -1;
-	int udp_sockfd = -1;
+static int socks5_handle_greeting(int client_sockfd) {
 
-	if ((client_sockfd = accept_connection(proxy)) == -1) {
-		goto cleanup;
-	}
-
-	// Conduct greeting phase and detect auth method from greeting message (currently only no auth
-	// supported)
 	uint8_t greeting[256];
-	ssize_t n;
+	ssize_t recv_len;
 	bool supports_noauth = false;
 
-	n = recv(client_sockfd, greeting, sizeof(greeting), 0);
+	recv_len = recv(client_sockfd, greeting, sizeof(greeting), 0);
 
-	if (n < 3 || greeting[0] != SOCKS5_VERSION)
-		goto cleanup;
+	if (recv_len < 3 || greeting[0] != SOCKS5_VERSION) {
+		return -1;
+	}
 
 	for (int i = 0; i < greeting[1]; i++) {
 		if (greeting[2 + i] == SOCKS5_AUTH_NONE) {
@@ -74,6 +66,22 @@ static void *socks5_proxy_thread(void *arg) {
 	}
 	uint8_t response[2] = {SOCKS5_VERSION, supports_noauth ? SOCKS5_AUTH_NONE : 0xFF};
 	send(client_sockfd, response, 2, 0);
+
+	return 0;
+}
+
+static void *socks5_proxy_thread(void *arg) {
+	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
+	int client_sockfd = -1;
+	int udp_sockfd = -1;
+
+	if ((client_sockfd = socks5_accept_connection(proxy)) == -1) {
+		goto cleanup;
+	}
+
+	if (socks5_handle_greeting(client_sockfd) == -1) {
+		goto cleanup;
+	}
 
 	// Conduct request phase
 	uint8_t request[512];
@@ -227,7 +235,6 @@ socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 	int sockfd;
 	sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sockfd == -1) {
-		// TODO: write better error message
 		perror("socket");
 		exit(EXIT_FAILURE);
 	}
