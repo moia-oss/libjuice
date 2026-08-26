@@ -147,6 +147,7 @@ static int socks5_create_udp_relay(int conn_fd) {
 
 	if (bind(udp_fd, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) == -1) {
 		perror("udp bind");
+		close(udp_fd);
 		return -1;
 	}
 
@@ -165,6 +166,57 @@ static int socks5_create_udp_relay(int conn_fd) {
 	send(conn_fd, reply, sizeof(reply), 0);
 
 	return udp_fd;
+}
+
+static void socks5_relay_udp(socks5_proxy_t *proxy, int udp_fd,
+                             struct sockaddr_in *client_udp_addr) {
+
+	// UDP relay loop
+	uint8_t buffer[MAX_DATAGRAM_SIZE];
+	struct sockaddr_in sender_addr;
+	socklen_t sender_len = sizeof(sender_addr);
+
+	while (atomic_load(&proxy->running)) {
+		struct pollfd pfd = {.fd = udp_fd, .events = POLLIN};
+		if (poll(&pfd, 1, 100) <= 0)
+			continue;
+
+		ssize_t recv_len = recvfrom(udp_fd, buffer, sizeof(buffer), 0,
+		                            (struct sockaddr *)&sender_addr, &sender_len);
+
+		if (recv_len < 0)
+			break;
+		if (recv_len < 10)
+			continue;
+
+		if (client_udp_addr->sin_port == 0) {
+			*client_udp_addr = sender_addr;
+		}
+
+		struct sockaddr_in dest_addr;
+		memset(&dest_addr, 0, sizeof(dest_addr));
+		dest_addr.sin_family = AF_INET;
+
+		if (sender_addr.sin_addr.s_addr == client_udp_addr->sin_addr.s_addr &&
+		    sender_addr.sin_port == client_udp_addr->sin_port) {
+
+			memcpy(&dest_addr.sin_addr, &buffer[4], 4);
+			memcpy(&dest_addr.sin_port, &buffer[8], 2);
+			sendto(udp_fd, buffer + 10, recv_len - 10, 0, (struct sockaddr *)&dest_addr,
+			       sizeof(dest_addr));
+		} else {
+			uint8_t wrapped[MAX_DATAGRAM_SIZE];
+			wrapped[0] = 0x00; // RSV
+			wrapped[1] = 0x00; // RSV
+			wrapped[2] = 0x00; // FRAG
+			wrapped[3] = SOCKS5_ATYP_IPV4;
+			memcpy(&wrapped[4], &sender_addr.sin_addr, 4);
+			memcpy(&wrapped[8], &sender_addr.sin_port, 2);
+			memcpy(&wrapped[10], buffer, recv_len);
+			sendto(udp_fd, wrapped, recv_len + 10, 0, (struct sockaddr *)client_udp_addr,
+			       sizeof(*client_udp_addr));
+		}
+	}
 }
 
 static void *socks5_proxy_thread(void *arg) {
@@ -191,52 +243,7 @@ static void *socks5_proxy_thread(void *arg) {
 		goto cleanup;
 	}
 
-	// UDP relay loop
-	uint8_t buffer[MAX_DATAGRAM_SIZE];
-	struct sockaddr_in sender_addr;
-	socklen_t sender_len = sizeof(sender_addr);
-
-	while (atomic_load(&proxy->running)) {
-		struct pollfd pfd = {.fd = udp_fd, .events = POLLIN};
-		if (poll(&pfd, 1, 100) <= 0)
-			continue;
-
-		ssize_t recv_len = recvfrom(udp_fd, buffer, sizeof(buffer), 0,
-		                            (struct sockaddr *)&sender_addr, &sender_len);
-
-		if (recv_len < 0)
-			break;
-		if (recv_len < 10)
-			continue;
-
-		if (client_udp_addr.sin_port == 0) {
-			client_udp_addr = sender_addr;
-		}
-
-		struct sockaddr_in dest_addr;
-		memset(&dest_addr, 0, sizeof(dest_addr));
-		dest_addr.sin_family = AF_INET;
-
-		if (sender_addr.sin_addr.s_addr == client_udp_addr.sin_addr.s_addr &&
-		    sender_addr.sin_port == client_udp_addr.sin_port) {
-
-			memcpy(&dest_addr.sin_addr, &buffer[4], 4);
-			memcpy(&dest_addr.sin_port, &buffer[8], 2);
-			sendto(udp_fd, buffer + 10, recv_len - 10, 0, (struct sockaddr *)&dest_addr,
-			       sizeof(dest_addr));
-		} else {
-			uint8_t wrapped[MAX_DATAGRAM_SIZE];
-			wrapped[0] = 0x00; // RSV
-			wrapped[1] = 0x00; // RSV
-			wrapped[2] = 0x00; // FRAG
-			wrapped[3] = SOCKS5_ATYP_IPV4;
-			memcpy(&wrapped[4], &sender_addr.sin_addr, 4);
-			memcpy(&wrapped[8], &sender_addr.sin_port, 2);
-			memcpy(&wrapped[10], buffer, recv_len);
-			sendto(udp_fd, wrapped, recv_len + 10, 0, (struct sockaddr *)&client_udp_addr,
-			       sizeof(client_udp_addr));
-		}
-	}
+	socks5_relay_udp(proxy, udp_fd, &client_udp_addr);
 
 cleanup:
 	close(proxy->tcp_fd);
