@@ -131,7 +131,6 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 		}
 	}
 
-	// Deep-copy SOCKS5 proxy config
 	if (config->socks5_proxy) {
 		agent->config.socks5_proxy = calloc(1, sizeof(juice_socks5_proxy_t));
 		if (!agent->config.socks5_proxy) {
@@ -391,8 +390,8 @@ int agent_resolve_servers(juice_agent_t *agent) {
 		if (!agent->config.stun_server_host) {
 			addr_record_t relay_addr;
 			if (conn_get_relay_addr(agent, &relay_addr) == 0) {
-				agent_add_local_reflexive_candidate(
-				    agent, ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE, &relay_addr);
+				agent_add_local_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE,
+				                                    &relay_addr);
 			}
 		}
 	}
@@ -942,7 +941,7 @@ int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_sta
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 				entry->next_transmission = 0;
 
-				if(entry->pair)
+				if (entry->pair)
 					entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
 
 				conn_interrupt(agent);
@@ -975,10 +974,10 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 				continue;
 
 			if (entry_is_tcp(entry)) {
-			    if (entry->tcp_state == TCP_STATE_DISCONNECTED)
+				if (entry->tcp_state == TCP_STATE_DISCONNECTED)
 					conn_tcp_connect(agent, &entry->record); // First attempt a TCP connection
 
-				if(entry->tcp_state != TCP_STATE_CONNECTED)
+				if (entry->tcp_state != TCP_STATE_CONNECTED)
 					continue;
 			}
 
