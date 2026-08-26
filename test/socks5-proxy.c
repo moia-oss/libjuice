@@ -58,15 +58,17 @@ static int socks5_accept_connection(socks5_proxy_t *proxy) {
 static int socks5_handle_greeting(int conn_fd, socks5_proxy_config_t *proxy_config) {
 
 	uint8_t greeting[256];
-	ssize_t recv_len;
-
-	recv_len = recv(conn_fd, greeting, sizeof(greeting), 0);
+	ssize_t recv_len = recv(conn_fd, greeting, sizeof(greeting), 0);
 
 	if (recv_len < 3 || greeting[0] != SOCKS5_VERSION) {
 		return -1;
 	}
 
-	for (int i = 0; i < greeting[1]; i++) {
+	uint8_t auth_methods_len = greeting[1];
+	if (recv_len < 2 + auth_methods_len) {
+		return -1;
+	}
+	for (int i = 0; i < auth_methods_len; i++) {
 		if (proxy_config->username != NULL && proxy_config->password != NULL) {
 			if (greeting[2 + i] == SOCKS5_AUTH_USERPASS) {
 				uint8_t response[2] = {SOCKS5_VERSION, SOCKS5_AUTH_USERPASS};
@@ -86,15 +88,23 @@ static int socks5_handle_greeting(int conn_fd, socks5_proxy_config_t *proxy_conf
 }
 
 static int socks5_handle_auth(int conn_fd, socks5_proxy_config_t *proxy_config) {
+
 	uint8_t buffer[512];
 	ssize_t buffer_len = recv(conn_fd, buffer, sizeof(buffer), 0);
-	if (buffer_len < 3) {
+
+	if (buffer_len < 2) {
 		return -1;
 	}
-
 	uint8_t ulen = buffer[1];
+
+	if (buffer_len < (2 + ulen + 1)) {
+		return -1;
+	}
 	uint8_t plen = buffer[2 + ulen];
 
+	if (buffer_len < (2 + ulen + 1 + plen)) {
+		return -1;
+	}
 	if ((ulen == strlen(proxy_config->username)) &&
 	    (memcmp(&buffer[2], proxy_config->username, ulen) == 0) &&
 	    (plen == strlen(proxy_config->password)) &&
@@ -263,6 +273,7 @@ static void socks5_relay_udp(socks5_proxy_t *proxy, int udp_fd,
 }
 
 static void *socks5_proxy_thread(void *proxy_arg) {
+
 	socks5_proxy_t *proxy = (socks5_proxy_t *)proxy_arg;
 	int conn_fd = -1;
 	int udp_fd = -1;
@@ -307,6 +318,10 @@ cleanup:
 socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 
 	socks5_proxy_t *proxy = malloc(sizeof(socks5_proxy_t));
+	if (!proxy) {
+		return NULL;
+	}
+
 	proxy->config = config;
 	atomic_store(&proxy->running, true);
 
@@ -315,7 +330,8 @@ socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 	listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (listen_fd == -1) {
 		perror("socket");
-		exit(EXIT_FAILURE);
+		free(proxy);
+		return NULL;
 	}
 
 	// Configure socket
@@ -330,13 +346,17 @@ socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 	// Bind socket
 	if (bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
 		perror("bind");
-		exit(EXIT_FAILURE);
+		close(listen_fd);
+		free(proxy);
+		return NULL;
 	}
 
 	// Mark socket as passive
 	if (listen(listen_fd, TCP_BACKLOG_SIZE) == -1) {
 		perror("listen");
-		exit(EXIT_FAILURE);
+		close(listen_fd);
+		free(proxy);
+		return NULL;
 	}
 
 	getsockname(listen_fd, (struct sockaddr *)&server_addr, &server_addr_len);
@@ -348,6 +368,7 @@ socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 	return proxy;
 }
 void socks5_proxy_stop(socks5_proxy_t *proxy) {
+
 	atomic_store(&proxy->running, false);
 	pthread_join(proxy->thread, NULL);
 	free(proxy);
