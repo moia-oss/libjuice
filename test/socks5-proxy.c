@@ -59,7 +59,6 @@ static int socks5_handle_greeting(int conn_fd, socks5_proxy_config_t *proxy_conf
 
 	uint8_t greeting[256];
 	ssize_t recv_len;
-	bool supports_noauth = false;
 
 	recv_len = recv(conn_fd, greeting, sizeof(greeting), 0);
 
@@ -116,8 +115,11 @@ static int socks5_handle_udp_associate(int conn_fd, struct sockaddr_in *client_u
 	client_udp_addr->sin_family = AF_INET;
 
 	uint8_t request[512];
-	ssize_t recv_len;
-	recv_len = recv(conn_fd, request, sizeof(request), 0);
+	ssize_t recv_len = recv(conn_fd, request, sizeof(request), 0);
+	if (recv_len < 10) {
+		return -1;
+	}
+
 	uint8_t ver = request[0];
 	uint8_t cmd = request[1];
 	uint8_t atyp = request[3];
@@ -265,7 +267,8 @@ static void *socks5_proxy_thread(void *proxy_arg) {
 	int conn_fd = -1;
 	int udp_fd = -1;
 
-	if ((conn_fd = socks5_accept_connection(proxy)) == -1) {
+	conn_fd = socks5_accept_connection(proxy);
+	if (conn_fd == -1) {
 		goto cleanup;
 	}
 
@@ -273,7 +276,7 @@ static void *socks5_proxy_thread(void *proxy_arg) {
 		goto cleanup;
 	}
 
-	if (proxy->config->username != NULL && proxy->config->username != NULL) {
+	if (proxy->config->username != NULL && proxy->config->password != NULL) {
 		if (socks5_handle_auth(conn_fd, proxy->config) == -1) {
 			goto cleanup;
 		}
@@ -285,8 +288,8 @@ static void *socks5_proxy_thread(void *proxy_arg) {
 	if (socks5_handle_udp_associate(conn_fd, &client_udp_addr) == -1) {
 		goto cleanup;
 	}
-
-	if ((udp_fd = socks5_create_udp_relay(conn_fd)) == -1) {
+	udp_fd = socks5_create_udp_relay(conn_fd);
+	if (udp_fd == -1) {
 		goto cleanup;
 	}
 
