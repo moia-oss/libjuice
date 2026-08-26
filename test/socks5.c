@@ -6,7 +6,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-#include "juice/juice.h"
 #include "socks5.h"
 
 #include <stdio.h>
@@ -59,7 +58,8 @@ int test_socks5(void) {
 		// Unwrap
 		char unwrapped[256];
 		addr_record_t src;
-		int data_len = socks5_unwrap_udp(wrapped, (size_t)wrapped_len, unwrapped, sizeof(unwrapped), &src);
+		int data_len =
+		    socks5_unwrap_udp(wrapped, (size_t)wrapped_len, unwrapped, sizeof(unwrapped), &src);
 		if (data_len < 0) {
 			fprintf(stderr, "socks5_unwrap_udp failed for IPv4\n");
 			return -1;
@@ -124,7 +124,8 @@ int test_socks5(void) {
 		// Unwrap
 		char unwrapped[256];
 		addr_record_t src;
-		int data_len = socks5_unwrap_udp(wrapped, (size_t)wrapped_len, unwrapped, sizeof(unwrapped), &src);
+		int data_len =
+		    socks5_unwrap_udp(wrapped, (size_t)wrapped_len, unwrapped, sizeof(unwrapped), &src);
 		if (data_len < 0) {
 			fprintf(stderr, "socks5_unwrap_udp failed for IPv6\n");
 			return -1;
