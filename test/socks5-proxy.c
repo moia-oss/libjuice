@@ -129,6 +129,44 @@ static int socks5_handle_udp_associate(int conn_fd, struct sockaddr_in *client_u
 	return 0;
 }
 
+static int socks5_create_udp_relay(int conn_fd) {
+
+	// Create UDP relay socket
+	int udp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (udp_fd == -1) {
+		perror("udp_socket");
+		return -1;
+	}
+
+	// Bind to any port
+	struct sockaddr_in udp_addr;
+	memset(&udp_addr, 0, sizeof(udp_addr));
+	udp_addr.sin_family = AF_INET;
+	udp_addr.sin_port = htons(0);
+	udp_addr.sin_addr.s_addr = INADDR_ANY;
+
+	if (bind(udp_fd, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) == -1) {
+		perror("udp bind");
+		return -1;
+	}
+
+	// Get ip address and port and store it
+	socklen_t udp_addr_len = sizeof(udp_addr);
+	getsockname(udp_fd, (struct sockaddr *)&udp_addr, &udp_addr_len);
+
+	// Send UDP socket info to client
+	uint8_t reply[10];
+	reply[0] = SOCKS5_VERSION;
+	reply[1] = SOCKS5_REP_SUCCESS;
+	reply[2] = 0x00; // reserved
+	reply[3] = SOCKS5_ATYP_IPV4;
+	memcpy(&reply[4], &udp_addr.sin_addr, 4);
+	memcpy(&reply[8], &udp_addr.sin_port, 2);
+	send(conn_fd, reply, sizeof(reply), 0);
+
+	return udp_fd;
+}
+
 static void *socks5_proxy_thread(void *arg) {
 	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
 	int conn_fd = -1;
@@ -149,38 +187,9 @@ static void *socks5_proxy_thread(void *arg) {
 		goto cleanup;
 	}
 
-	// Create UDP socket
-	udp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (udp_fd == -1) {
-		perror("udp_socket");
+	if ((udp_fd = socks5_create_udp_relay(conn_fd)) == -1) {
 		goto cleanup;
 	}
-
-	// Bind to any port
-	struct sockaddr_in udp_addr;
-	memset(&udp_addr, 0, sizeof(udp_addr));
-	udp_addr.sin_family = AF_INET;
-	udp_addr.sin_port = htons(0);
-	udp_addr.sin_addr.s_addr = INADDR_ANY;
-
-	if (bind(udp_fd, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) == -1) {
-		perror("udp bind");
-		goto cleanup;
-	}
-
-	// Get ip address and port and store it
-	socklen_t udp_addr_len = sizeof(udp_addr);
-	getsockname(udp_fd, (struct sockaddr *)&udp_addr, &udp_addr_len);
-
-	// Send UDP socket info to client
-	uint8_t reply[10];
-	reply[0] = SOCKS5_VERSION;
-	reply[1] = SOCKS5_REP_SUCCESS;
-	reply[2] = 0x00; // reserved
-	reply[3] = SOCKS5_ATYP_IPV4;
-	memcpy(&reply[4], &udp_addr.sin_addr, 4);
-	memcpy(&reply[8], &udp_addr.sin_port, 2);
-	send(conn_fd, reply, sizeof(reply), 0);
 
 	// UDP relay loop
 	uint8_t buffer[MAX_DATAGRAM_SIZE];
