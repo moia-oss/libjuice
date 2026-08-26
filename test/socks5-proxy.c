@@ -46,13 +46,13 @@ static int socks5_accept_connection(socks5_proxy_t *proxy) {
 	return -1;
 }
 
-static int socks5_handle_greeting(int client_sockfd) {
+static int socks5_handle_greeting(int conn_fd) {
 
 	uint8_t greeting[256];
 	ssize_t recv_len;
 	bool supports_noauth = false;
 
-	recv_len = recv(client_sockfd, greeting, sizeof(greeting), 0);
+	recv_len = recv(conn_fd, greeting, sizeof(greeting), 0);
 
 	if (recv_len < 3 || greeting[0] != SOCKS5_VERSION) {
 		return -1;
@@ -65,33 +65,25 @@ static int socks5_handle_greeting(int client_sockfd) {
 		}
 	}
 	uint8_t response[2] = {SOCKS5_VERSION, supports_noauth ? SOCKS5_AUTH_NONE : 0xFF};
-	send(client_sockfd, response, 2, 0);
+	send(conn_fd, response, 2, 0);
 
 	return 0;
 }
 
-static void *socks5_proxy_thread(void *arg) {
-	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
-	int client_sockfd = -1;
-	int udp_sockfd = -1;
+static int socks5_handle_udp_associate(int conn_fd, struct sockaddr_in *client_udp_addr) {
 
-	if ((client_sockfd = socks5_accept_connection(proxy)) == -1) {
-		goto cleanup;
-	}
+	client_udp_addr->sin_family = AF_INET;
 
-	if (socks5_handle_greeting(client_sockfd) == -1) {
-		goto cleanup;
-	}
-
-	// Conduct request phase
 	uint8_t request[512];
-	n = recv(client_sockfd, request, sizeof(request), 0);
+	ssize_t recv_len;
+	recv_len = recv(conn_fd, request, sizeof(request), 0);
 	uint8_t ver = request[0];
 	uint8_t cmd = request[1];
 	uint8_t atyp = request[3];
 
-	if (ver != SOCKS5_VERSION)
-		goto cleanup;
+	if (ver != SOCKS5_VERSION) {
+		return -1;
+	}
 
 	if (cmd != SOCKS5_CMD_UDP_ASSOCIATE) {
 		uint8_t reply[] = {SOCKS5_VERSION,
@@ -104,23 +96,20 @@ static void *socks5_proxy_thread(void *arg) {
 		                   0,
 		                   0,
 		                   0};
-		send(client_sockfd, reply, sizeof(reply), 0);
-		goto cleanup;
+		send(conn_fd, reply, sizeof(reply), 0);
+		return -1;
 	}
 
 	// Parse address based on atyp
-	struct sockaddr_in client_udp_addr;
-	memset(&client_udp_addr, 0, sizeof(client_udp_addr));
-	client_udp_addr.sin_family = AF_INET;
 
 	switch (atyp) {
 	case SOCKS5_ATYP_IPV4:
-		memcpy(&client_udp_addr.sin_addr, &request[4], 4);
-		memcpy(&client_udp_addr.sin_port, &request[8], 2);
+		memcpy(&client_udp_addr->sin_addr, &request[4], 4);
+		memcpy(&client_udp_addr->sin_port, &request[8], 2);
 		break;
 	case SOCKS5_ATYP_IPV6:
 	case SOCKS5_ATYP_DOMAIN:
-		goto cleanup;
+		return -1;
 	default: {
 		uint8_t reply[] = {SOCKS5_VERSION,
 		                   SOCKS5_REP_ADDRESS_TYPE_NOT_SUPPORTED,
@@ -132,14 +121,37 @@ static void *socks5_proxy_thread(void *arg) {
 		                   0,
 		                   0,
 		                   0};
-		send(client_sockfd, reply, sizeof(reply), 0);
-		goto cleanup;
+		send(conn_fd, reply, sizeof(reply), 0);
+		return -1;
 	}
 	}
 
+	return 0;
+}
+
+static void *socks5_proxy_thread(void *arg) {
+	socks5_proxy_t *proxy = (socks5_proxy_t *)arg;
+	int conn_fd = -1;
+	int udp_fd = -1;
+
+	if ((conn_fd = socks5_accept_connection(proxy)) == -1) {
+		goto cleanup;
+	}
+
+	if (socks5_handle_greeting(conn_fd) == -1) {
+		goto cleanup;
+	}
+
+	struct sockaddr_in client_udp_addr;
+	memset(&client_udp_addr, 0, sizeof(client_udp_addr));
+
+	if (socks5_handle_udp_associate(conn_fd, &client_udp_addr) == -1) {
+		goto cleanup;
+	}
+
 	// Create UDP socket
-	udp_sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (udp_sockfd == -1) {
+	udp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (udp_fd == -1) {
 		perror("udp_socket");
 		goto cleanup;
 	}
@@ -151,14 +163,14 @@ static void *socks5_proxy_thread(void *arg) {
 	udp_addr.sin_port = htons(0);
 	udp_addr.sin_addr.s_addr = INADDR_ANY;
 
-	if (bind(udp_sockfd, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) == -1) {
+	if (bind(udp_fd, (struct sockaddr *)&udp_addr, sizeof(udp_addr)) == -1) {
 		perror("udp bind");
 		goto cleanup;
 	}
 
 	// Get ip address and port and store it
 	socklen_t udp_addr_len = sizeof(udp_addr);
-	getsockname(udp_sockfd, (struct sockaddr *)&udp_addr, &udp_addr_len);
+	getsockname(udp_fd, (struct sockaddr *)&udp_addr, &udp_addr_len);
 
 	// Send UDP socket info to client
 	uint8_t reply[10];
@@ -168,7 +180,7 @@ static void *socks5_proxy_thread(void *arg) {
 	reply[3] = SOCKS5_ATYP_IPV4;
 	memcpy(&reply[4], &udp_addr.sin_addr, 4);
 	memcpy(&reply[8], &udp_addr.sin_port, 2);
-	send(client_sockfd, reply, sizeof(reply), 0);
+	send(conn_fd, reply, sizeof(reply), 0);
 
 	// UDP relay loop
 	uint8_t buffer[MAX_DATAGRAM_SIZE];
@@ -176,11 +188,11 @@ static void *socks5_proxy_thread(void *arg) {
 	socklen_t sender_len = sizeof(sender_addr);
 
 	while (atomic_load(&proxy->running)) {
-		struct pollfd pfd = {.fd = udp_sockfd, .events = POLLIN};
+		struct pollfd pfd = {.fd = udp_fd, .events = POLLIN};
 		if (poll(&pfd, 1, 100) <= 0)
 			continue;
 
-		ssize_t recv_len = recvfrom(udp_sockfd, buffer, sizeof(buffer), 0,
+		ssize_t recv_len = recvfrom(udp_fd, buffer, sizeof(buffer), 0,
 		                            (struct sockaddr *)&sender_addr, &sender_len);
 
 		if (recv_len < 0)
@@ -201,7 +213,7 @@ static void *socks5_proxy_thread(void *arg) {
 
 			memcpy(&dest_addr.sin_addr, &buffer[4], 4);
 			memcpy(&dest_addr.sin_port, &buffer[8], 2);
-			sendto(udp_sockfd, buffer + 10, recv_len - 10, 0, (struct sockaddr *)&dest_addr,
+			sendto(udp_fd, buffer + 10, recv_len - 10, 0, (struct sockaddr *)&dest_addr,
 			       sizeof(dest_addr));
 		} else {
 			uint8_t wrapped[MAX_DATAGRAM_SIZE];
@@ -212,17 +224,17 @@ static void *socks5_proxy_thread(void *arg) {
 			memcpy(&wrapped[4], &sender_addr.sin_addr, 4);
 			memcpy(&wrapped[8], &sender_addr.sin_port, 2);
 			memcpy(&wrapped[10], buffer, recv_len);
-			sendto(udp_sockfd, wrapped, recv_len + 10, 0, (struct sockaddr *)&client_udp_addr,
+			sendto(udp_fd, wrapped, recv_len + 10, 0, (struct sockaddr *)&client_udp_addr,
 			       sizeof(client_udp_addr));
 		}
 	}
 
 cleanup:
 	close(proxy->tcp_fd);
-	if (client_sockfd != -1)
-		close(client_sockfd);
-	if (udp_sockfd != -1)
-		close(udp_sockfd);
+	if (conn_fd != -1)
+		close(conn_fd);
+	if (udp_fd != -1)
+		close(udp_fd);
 	return NULL;
 }
 
@@ -232,9 +244,9 @@ socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 	atomic_store(&proxy->running, true);
 
 	// Create TCP socket
-	int sockfd;
-	sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sockfd == -1) {
+	int listen_fd;
+	listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (listen_fd == -1) {
 		perror("socket");
 		exit(EXIT_FAILURE);
 	}
@@ -249,20 +261,20 @@ socks5_proxy_t *socks5_proxy_start(socks5_proxy_config_t *config) {
 	server_addr.sin_addr.s_addr = INADDR_ANY;
 
 	// Bind socket
-	if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+	if (bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
 		perror("bind");
 		exit(EXIT_FAILURE);
 	}
 
 	// Mark socket as passive
-	if (listen(sockfd, TCP_BACKLOG_SIZE) == -1) {
+	if (listen(listen_fd, TCP_BACKLOG_SIZE) == -1) {
 		perror("listen");
 		exit(EXIT_FAILURE);
 	}
 
-	getsockname(sockfd, (struct sockaddr *)&server_addr, &server_addr_len);
+	getsockname(listen_fd, (struct sockaddr *)&server_addr, &server_addr_len);
 	proxy->port = ntohs(server_addr.sin_port);
-	proxy->tcp_fd = sockfd;
+	proxy->tcp_fd = listen_fd;
 
 	pthread_create(&proxy->thread, NULL, socks5_proxy_thread, (void *)proxy);
 
