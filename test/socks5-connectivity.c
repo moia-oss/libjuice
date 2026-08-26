@@ -9,6 +9,7 @@
 #include "juice/juice.h"
 #include "socks5-proxy.h"
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,8 +31,11 @@ static void usleep(unsigned int usecs) { Sleep(usecs / 1000); }
 static juice_agent_t *agent1;
 static juice_agent_t *agent2;
 
-static bool received1 = false;
-static bool received2 = false;
+static atomic_bool gathering_done1 = false;
+static atomic_bool gathering_done2 = false;
+
+static atomic_bool received1 = false;
+static atomic_bool received2 = false;
 
 static void on_state_changed1(juice_agent_t *agent, juice_state_t state, void *user_ptr);
 static void on_state_changed2(juice_agent_t *agent, juice_state_t state, void *user_ptr);
@@ -52,12 +56,18 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
                                         socks5_proxy_config_t *proxy_config) {
 
 	juice_set_log_level(JUICE_LOG_LEVEL_DEBUG);
+	bool success = true;
 
 	received1 = false;
 	received2 = false;
+	gathering_done1 = false;
+	gathering_done2 = false;
+	agent1 = NULL;
+	agent2 = NULL;
 	juice_server_t *server = NULL;
 	uint16_t server_port = 0;
 
+	// Start local STUN/TURN server
 	if (candidate_type == CANDIDATE_TYPE_SRFLX || candidate_type == CANDIDATE_TYPE_RELAY) {
 		juice_server_credentials_t credentials = {"user", "pass", 2};
 		juice_server_config_t server_config;
@@ -76,11 +86,11 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
 	socks5_proxy_t *proxy = socks5_proxy_start(proxy_config);
 	if (!proxy) {
 		fprintf(stderr, "Failed to create the socks proxy\n");
-		socks5_proxy_stop(proxy);
-		return -1;
+		success = false;
+		goto cleanup;
 	}
 
-	// SOCKS5 proxy config
+	// SOCKS5 proxy client config
 	juice_socks5_proxy_t socks5_proxy;
 	memset(&socks5_proxy, 0, sizeof(socks5_proxy));
 	socks5_proxy.host = "127.0.0.1";
@@ -122,8 +132,8 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
 	agent1 = juice_create(&config1);
 	if (!agent1) {
 		fprintf(stderr, "Failed to create agent 1\n");
-		socks5_proxy_stop(proxy);
-		return -1;
+		success = false;
+		goto cleanup;
 	}
 
 	// Agent 2: Create agent without SOCKS5 proxy (direct)
@@ -141,9 +151,8 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
 	agent2 = juice_create(&config2);
 	if (!agent2) {
 		fprintf(stderr, "Failed to create agent 2\n");
-		juice_destroy(agent1);
-		socks5_proxy_stop(proxy);
-		return -1;
+		success = false;
+		goto cleanup;
 	}
 
 	// Exchange SDP descriptions
@@ -161,13 +170,29 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
 
 	// Gather candidates
 	juice_gather_candidates(agent1);
-	sleep(2);
+	int attempts = 0;
+	while (!atomic_load(&gathering_done1) && attempts++ < 100) { // up to 5 seconds
+		usleep(50000);                                           // 50ms
+	}
+	if (!atomic_load(&gathering_done1)) {
+		fprintf(stderr, "Gathering 1 timed out\n");
+		success = false;
+		goto cleanup;
+	}
 
 	juice_gather_candidates(agent2);
-	sleep(2);
+	attempts = 0;
+	while (!atomic_load(&gathering_done2) && attempts++ < 100) { // up to 5 seconds
+		usleep(50000);                                           // 50ms
+	}
+	if (!atomic_load(&gathering_done2)) {
+		fprintf(stderr, "Gathering 2 timed out\n");
+		success = false;
+		goto cleanup;
+	}
 
 	// Wait for connection to complete
-	int attempts = 0;
+	attempts = 0;
 	while (attempts < 20) { // up to 10 seconds
 		juice_state_t state1 = juice_get_state(agent1);
 		juice_state_t state2 = juice_get_state(agent2);
@@ -182,64 +207,71 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
 	// Check states
 	juice_state_t state1 = juice_get_state(agent1);
 	juice_state_t state2 = juice_get_state(agent2);
-	bool success = (state1 == JUICE_STATE_COMPLETED && state2 == JUICE_STATE_COMPLETED);
+	success = (state1 == JUICE_STATE_COMPLETED && state2 == JUICE_STATE_COMPLETED);
 
-	if (success) {
-		printf("ICE handshake completed through SOCKS5 proxy\n");
-	} else {
+	if (!success) {
 		printf("ICE handshake failed: state1=%s, state2=%s\n", juice_state_to_string(state1),
 		       juice_state_to_string(state2));
+		goto cleanup;
 	}
 
-	// Retrieve selected candidates
-	if (success) {
-		char local[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
-		char remote[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
-		if (juice_get_selected_candidates(agent1, local, JUICE_MAX_CANDIDATE_SDP_STRING_LEN, remote,
-		                                  JUICE_MAX_CANDIDATE_SDP_STRING_LEN) == 0) {
-			printf("Local candidate  1: %s\n", local);
-			printf("Remote candidate 1: %s\n", remote);
-		}
-		if (juice_get_selected_candidates(agent2, local, JUICE_MAX_CANDIDATE_SDP_STRING_LEN, remote,
-		                                  JUICE_MAX_CANDIDATE_SDP_STRING_LEN) == 0) {
-			printf("Local candidate  2: %s\n", local);
-			printf("Remote candidate 2: %s\n", remote);
-		}
+	printf("ICE handshake completed through SOCKS5 proxy\n");
 
-		char localAddr[JUICE_MAX_ADDRESS_STRING_LEN];
-		char remoteAddr[JUICE_MAX_ADDRESS_STRING_LEN];
-		if (juice_get_selected_addresses(agent1, localAddr, JUICE_MAX_ADDRESS_STRING_LEN,
-		                                 remoteAddr, JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
-			printf("Local address  1: %s\n", localAddr);
-			printf("Remote address 1: %s\n", remoteAddr);
-		}
-		if (juice_get_selected_addresses(agent2, localAddr, JUICE_MAX_ADDRESS_STRING_LEN,
-		                                 remoteAddr, JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
-			printf("Local address  2: %s\n", localAddr);
-			printf("Remote address 2: %s\n", remoteAddr);
-		}
+	char local[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
+	char remote[JUICE_MAX_CANDIDATE_SDP_STRING_LEN];
+	if (juice_get_selected_candidates(agent1, local, JUICE_MAX_CANDIDATE_SDP_STRING_LEN, remote,
+	                                  JUICE_MAX_CANDIDATE_SDP_STRING_LEN) == 0) {
+		printf("Local candidate  1: %s\n", local);
+		printf("Remote candidate 1: %s\n", remote);
+	}
+	if (juice_get_selected_candidates(agent2, local, JUICE_MAX_CANDIDATE_SDP_STRING_LEN, remote,
+	                                  JUICE_MAX_CANDIDATE_SDP_STRING_LEN) == 0) {
+		printf("Local candidate  2: %s\n", local);
+		printf("Remote candidate 2: %s\n", remote);
 	}
 
-	// Verify data was received
-	if (success) {
-		// Give a moment for data exchange
-		sleep(1);
-		if (!received1 || !received2) {
-			printf("Data exchange failed: received1=%d, received2=%d\n", received1, received2);
-			success = false;
-		}
+	char localAddr[JUICE_MAX_ADDRESS_STRING_LEN];
+	char remoteAddr[JUICE_MAX_ADDRESS_STRING_LEN];
+	if (juice_get_selected_addresses(agent1, localAddr, JUICE_MAX_ADDRESS_STRING_LEN, remoteAddr,
+	                                 JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
+		printf("Local address  1: %s\n", localAddr);
+		printf("Remote address 1: %s\n", remoteAddr);
+	}
+	if (juice_get_selected_addresses(agent2, localAddr, JUICE_MAX_ADDRESS_STRING_LEN, remoteAddr,
+	                                 JUICE_MAX_ADDRESS_STRING_LEN) == 0) {
+		printf("Local address  2: %s\n", localAddr);
+		printf("Remote address 2: %s\n", remoteAddr);
 	}
 
+	// Give a moment for data exchange
+	attempts = 0;
+	while ((!atomic_load(&received1) || !atomic_load(&received2)) &&
+	       attempts++ < 100) { // up to 5 seconds
+		usleep(50000);         // 50ms
+	}
+	if (!atomic_load(&received1) || !atomic_load(&received2)) {
+		printf("Data exchange failed: received1=%d, received2=%d\n", received1, received2);
+		success = false;
+	}
+
+cleanup:
 	// Cleanup
 	if (server) {
 		juice_server_destroy(server);
 	}
-	juice_destroy(agent1);
-	juice_destroy(agent2);
-	socks5_proxy_stop(proxy);
+	if (agent1) {
+		juice_destroy(agent1);
+	}
+	if (agent2) {
+		juice_destroy(agent2);
+	}
+	if (proxy) {
+		socks5_proxy_stop(proxy);
+	}
 
 	return success ? 0 : -1;
 }
+
 int test_socks5_connectivity(void) {
 
 	socks5_proxy_config_t noauth = {NULL, NULL};
@@ -292,6 +324,7 @@ static void on_gathering_done1(juice_agent_t *agent, void *user_ptr) {
 	(void)user_ptr;
 	printf("Gathering done 1\n");
 	juice_set_remote_gathering_done(agent2);
+	atomic_store(&gathering_done1, true);
 }
 
 static void on_gathering_done2(juice_agent_t *agent, void *user_ptr) {
@@ -299,6 +332,7 @@ static void on_gathering_done2(juice_agent_t *agent, void *user_ptr) {
 	(void)user_ptr;
 	printf("Gathering done 2\n");
 	juice_set_remote_gathering_done(agent1);
+	atomic_store(&gathering_done2, true);
 }
 
 static void on_recv1(juice_agent_t *agent, const char *data, size_t size, void *user_ptr) {
@@ -310,7 +344,7 @@ static void on_recv1(juice_agent_t *agent, const char *data, size_t size, void *
 	memcpy(buffer, data, size);
 	buffer[size] = '\0';
 	printf("Received 1: %s\n", buffer);
-	received1 = true;
+	atomic_store(&received1, true);
 }
 
 static void on_recv2(juice_agent_t *agent, const char *data, size_t size, void *user_ptr) {
@@ -322,5 +356,5 @@ static void on_recv2(juice_agent_t *agent, const char *data, size_t size, void *
 	memcpy(buffer, data, size);
 	buffer[size] = '\0';
 	printf("Received 2: %s\n", buffer);
-	received2 = true;
+	atomic_store(&received2, true);
 }
