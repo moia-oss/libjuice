@@ -177,7 +177,7 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 	return INVALID_SOCKET;
 }
 
-int udp_recvfrom_raw(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
 	while (true) {
 		src->len = sizeof(src->addr);
 		src->socktype = SOCK_DGRAM;
@@ -202,7 +202,7 @@ int udp_recvfrom_raw(socket_t sock, char *buffer, size_t size, addr_record_t *sr
 	}
 }
 
-int udp_sendto_raw(socket_t sock, const char *data, size_t size, const addr_record_t *dst) {
+int udp_sendto(socket_t sock, const char *data, size_t size, const addr_record_t *dst) {
 #ifndef __linux__
 	addr_record_t tmp = *dst;
 	addr_record_t name;
@@ -695,7 +695,7 @@ void udp_close(udp_socket_context_t *ctx) {
 	}
 }
 
-int udp_sendto(udp_socket_context_t *ctx, const char *data, size_t size, const addr_record_t *dst) {
+int udp_ctx_sendto(udp_socket_context_t *ctx, const char *data, size_t size, const addr_record_t *dst) {
 	if (ctx->socks5 && ctx->socks5->state == SOCKS5_STATE_READY) {
 		char wrapped[UDP_SOCKS5_BUFFER_SIZE];
 		int wrapped_len = socks5_wrap_udp(wrapped, UDP_SOCKS5_BUFFER_SIZE, data, size, dst);
@@ -703,16 +703,16 @@ int udp_sendto(udp_socket_context_t *ctx, const char *data, size_t size, const a
 			JLOG_WARN("Failed to wrap SOCKS5 UDP header");
 			return -1;
 		}
-		return udp_sendto_raw(ctx->sock, wrapped, (size_t)wrapped_len, &ctx->socks5->relay_addr);
+		return udp_sendto(ctx->sock, wrapped, (size_t)wrapped_len, &ctx->socks5->relay_addr);
 	}
-	return udp_sendto_raw(ctx->sock, data, size, dst);
+	return udp_sendto(ctx->sock, data, size, dst);
 }
 
-int udp_recvfrom(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src) {
+int udp_ctx_recvfrom(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src) {
 	if (ctx->socks5 && ctx->socks5->state == SOCKS5_STATE_READY) {
 		char raw[UDP_SOCKS5_BUFFER_SIZE];
 		addr_record_t relay_src;
-		int len = udp_recvfrom_raw(ctx->sock, raw, UDP_SOCKS5_BUFFER_SIZE, &relay_src);
+		int len = udp_recvfrom(ctx->sock, raw, UDP_SOCKS5_BUFFER_SIZE, &relay_src);
 		if (len <= 0)
 			return len;
 		int data_len = socks5_unwrap_udp(raw, (size_t)len, buffer, size, src);
@@ -722,7 +722,7 @@ int udp_recvfrom(udp_socket_context_t *ctx, char *buffer, size_t size, addr_reco
 		}
 		return data_len;
 	}
-	return udp_recvfrom_raw(ctx->sock, buffer, size, src);
+	return udp_recvfrom(ctx->sock, buffer, size, src);
 }
 
 socket_t udp_get_control_socket(const udp_socket_context_t *ctx) {

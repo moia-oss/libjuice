@@ -517,7 +517,7 @@ int conn_mux_recv(conn_registry_t *registry, char *buffer, size_t size, addr_rec
 	JLOG_VERBOSE("Receiving datagram");
 	registry_impl_t *registry_impl = registry->impl;
 	int len;
-	while ((len = udp_recvfrom(&registry_impl->udp, buffer, size, src)) == 0) {
+	while ((len = udp_ctx_recvfrom(&registry_impl->udp, buffer, size, src)) == 0) {
 		// Empty datagram (used to interrupt) or SOCKS5 unwrap failure
 	}
 
@@ -661,7 +661,7 @@ int conn_mux_send(juice_agent_t *agent, const addr_record_t *dst, const char *da
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	int ret = udp_sendto(&registry_impl->udp, data, size, dst);
+	int ret = udp_ctx_sendto(&registry_impl->udp, data, size, dst);
 	if (ret < 0) {
 		ret = -sockerrno;
 		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)

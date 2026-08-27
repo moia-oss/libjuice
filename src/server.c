@@ -414,7 +414,7 @@ void server_run(juice_server_t *server) {
 int server_send(juice_server_t *server, const addr_record_t *dst, const char *data, size_t size) {
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	int ret = udp_sendto_raw(server->sock, data, size, dst);
+	int ret = udp_sendto(server->sock, data, size, dst);
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Send failed, errno=%d", sockerrno);
 
@@ -442,7 +442,7 @@ int server_recv(juice_server_t *server) {
 	while (true) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t record;
-		int len = udp_recvfrom_raw(server->sock, buffer, BUFFER_SIZE, &record);
+		int len = udp_recvfrom(server->sock, buffer, BUFFER_SIZE, &record);
 		if (len < 0) {
 			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK) {
 				JLOG_VERBOSE("No more datagrams to receive");
@@ -468,7 +468,7 @@ int server_forward(juice_server_t *server, server_turn_alloc_t *alloc) {
 	while (true) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t record;
-		int len = udp_recvfrom_raw(alloc->sock, buffer, BUFFER_SIZE, &record);
+		int len = udp_recvfrom(alloc->sock, buffer, BUFFER_SIZE, &record);
 		if (len < 0) {
 			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK) {
 				break;
@@ -504,7 +504,7 @@ int server_forward(juice_server_t *server, server_turn_alloc_t *alloc) {
 
 			JLOG_VERBOSE("Forwarding as ChannelData, size=%d", len);
 
-			int ret = udp_sendto_raw(server->sock, buffer, len, &alloc->record);
+			int ret = udp_sendto(server->sock, buffer, len, &alloc->record);
 			if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 				JLOG_WARN("Send failed, errno=%d", sockerrno);
 
@@ -1139,7 +1139,7 @@ int server_process_turn_send(juice_server_t *server, const stun_message_t *msg,
 
 	JLOG_VERBOSE("Forwarding datagram to peer, size=%zu", msg->data_size);
 
-	int ret = udp_sendto_raw(alloc->sock, msg->data, msg->data_size, peer);
+	int ret = udp_sendto(alloc->sock, msg->data, msg->data_size, peer);
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Forwarding failed, errno=%d", sockerrno);
 
@@ -1179,7 +1179,7 @@ int server_process_channel_data(juice_server_t *server, char *buf, size_t len,
 
 	JLOG_VERBOSE("Forwarding datagram to peer, size=%zu", len);
 
-	int ret = udp_sendto_raw(alloc->sock, buf, len, &record);
+	int ret = udp_sendto(alloc->sock, buf, len, &record);
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Send failed, errno=%d", sockerrno);
 
