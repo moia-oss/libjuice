@@ -280,6 +280,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 		return -1;
 	}
 
+	if (!agent->config.socks5_proxy || !agent->config.socks5_proxy->host) {
 	addr_record_t records[ICE_MAX_CANDIDATES_COUNT - 1];
 	int records_count = conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
 	if (records_count < 0) {
@@ -335,6 +336,23 @@ int agent_gather_candidates(juice_agent_t *agent) {
 			JLOG_WARN("No local host candidates gathered, unable to add TCP candidates");
 		}
 	}
+	} else {
+		addr_record_t relay_addr;
+		conn_lock(agent);
+		if (conn_get_relay_addr(agent, &relay_addr) == 0) {
+			ice_candidate_t candidate;
+			if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_HOST, 1,
+			                               agent->local.candidates_count, &relay_addr, &candidate,
+			                               ICE_CANDIDATE_TRANSPORT_UDP) == 0) {
+				if (agent->local.candidates_count >= MAX_HOST_CANDIDATES_COUNT) {
+					JLOG_WARN(
+					    "Local description already has the maximum number of host candidates");
+				} else {
+					ice_add_candidate(&candidate, &agent->local);
+				}
+			}
+		}
+	}
 
 	ice_sort_candidates(&agent->local);
 
@@ -383,18 +401,6 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 int agent_resolve_servers(juice_agent_t *agent) {
 	conn_lock(agent);
-
-	// If a SOCKS5 proxy is configured and no STUN server is set,
-	// add the relay address as a server-reflexive candidate
-	if (agent->config.socks5_proxy && agent->config.socks5_proxy->host) {
-		if (!agent->config.stun_server_host) {
-			addr_record_t relay_addr;
-			if (conn_get_relay_addr(agent, &relay_addr) == 0) {
-				agent_add_local_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE,
-				                                    &relay_addr);
-			}
-		}
-	}
 
 	// TURN server resolution
 	juice_concurrency_mode_t mode = agent->config.concurrency_mode;

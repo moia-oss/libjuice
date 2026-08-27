@@ -6,6 +6,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+#include "agent.h"
+#include "ice.h"
 #include "juice/juice.h"
 #include "socks5-proxy.h"
 
@@ -178,6 +180,17 @@ static int run_socks5_connectivity_test(candidate_type_t candidate_type,
 		fprintf(stderr, "Gathering 1 timed out\n");
 		success = false;
 		goto cleanup;
+	}
+
+	if (candidate_type == CANDIDATE_TYPE_HOST) {
+		if (agent1->local.candidates_count != 1 ||
+		    agent1->local.candidates[0].type != ICE_CANDIDATE_TYPE_HOST) {
+			fprintf(stderr, "Expected 1 host candidate, got %d candidates (first type=%d)\n",
+			        agent1->local.candidates_count,
+			        agent1->local.candidates_count > 0 ? agent1->local.candidates[0].type : -1);
+			success = false;
+			goto cleanup;
+		}
 	}
 
 	juice_gather_candidates(agent2);
