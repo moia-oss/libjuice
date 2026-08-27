@@ -138,7 +138,7 @@ int conn_thread_process(juice_agent_t *agent, struct pollfd *pfd) {
 int conn_thread_recv(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src) {
 	JLOG_VERBOSE("Receiving datagram");
 	int len;
-	while ((len = udp_recvfrom(ctx, buffer, size, src)) == 0) {
+	while ((len = udp_ctx_recvfrom(ctx, buffer, size, src)) == 0) {
 		// Empty datagram (used to interrupt) or SOCKS5 unwrap failure
 	}
 
@@ -285,7 +285,7 @@ int conn_thread_send(juice_agent_t *agent, const addr_record_t *dst, const char 
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-	int ret = udp_sendto(&conn_impl->udp, data, size, dst);
+	int ret = udp_ctx_sendto(&conn_impl->udp, data, size, dst);
 	if (ret < 0) {
 		ret = -sockerrno;
 		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)

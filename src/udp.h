@@ -36,10 +36,10 @@ typedef struct udp_socket_context {
 socket_t udp_create_socket(const udp_socket_config_t *config);
 int udp_open(udp_socket_context_t *ctx, const udp_socket_config_t *config);
 void udp_close(udp_socket_context_t *ctx);
-int udp_recvfrom(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src);
-int udp_sendto(udp_socket_context_t *ctx, const char *data, size_t size, const addr_record_t *dst);
-int udp_recvfrom_raw(socket_t sock, char *buffer, size_t size, addr_record_t *src);
-int udp_sendto_raw(socket_t sock, const char *data, size_t size, const addr_record_t *dst);
+int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src);
+int udp_sendto(socket_t sock, const char *data, size_t size, const addr_record_t *dst);
+int udp_ctx_recvfrom(udp_socket_context_t *ctx, char *buffer, size_t size, addr_record_t *src);
+int udp_ctx_sendto(udp_socket_context_t *ctx, const char *data, size_t size, const addr_record_t *dst);
 int udp_sendto_self(socket_t sock, const char *data, size_t size);
 int udp_set_diffserv(socket_t sock, int ds);
 uint16_t udp_get_port(socket_t sock);
