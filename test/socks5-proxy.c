@@ -179,11 +179,6 @@ static int socks5_handle_udp_associate(int conn_fd, struct sockaddr_in *client_u
 	}
 	}
 
-	return 0;
-}
-
-static int socks5_create_udp_relay(int conn_fd) {
-
 	// Create UDP relay socket
 	int udp_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (udp_fd == -1) {
@@ -208,7 +203,7 @@ static int socks5_create_udp_relay(int conn_fd) {
 	socklen_t udp_addr_len = sizeof(udp_addr);
 	getsockname(udp_fd, (struct sockaddr *)&udp_addr, &udp_addr_len);
 
-	// Send UDP socket info to client
+	// Send UDP relay address to client
 	uint8_t reply[10];
 	reply[0] = SOCKS5_VERSION;
 	reply[1] = SOCKS5_REP_SUCCESS;
@@ -296,10 +291,7 @@ static void *socks5_proxy_thread(void *proxy_arg) {
 	struct sockaddr_in client_udp_addr;
 	memset(&client_udp_addr, 0, sizeof(client_udp_addr));
 
-	if (socks5_handle_udp_associate(conn_fd, &client_udp_addr) == -1) {
-		goto cleanup;
-	}
-	udp_fd = socks5_create_udp_relay(conn_fd);
+	udp_fd = socks5_handle_udp_associate(conn_fd, &client_udp_addr);
 	if (udp_fd == -1) {
 		goto cleanup;
 	}
