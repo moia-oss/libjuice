@@ -84,6 +84,13 @@ typedef struct juice_turn_server {
 	uint16_t port;
 } juice_turn_server_t;
 
+typedef struct juice_socks5_proxy {
+	const char *host;
+	uint16_t port;
+	const char *username; // NULL for no authentication
+	const char *password; // NULL for no authentication
+} juice_socks5_proxy_t;
+
 typedef enum juice_concurrency_mode {
 	JUICE_CONCURRENCY_MODE_POLL = 0, // Connections share a single thread
 	JUICE_CONCURRENCY_MODE_MUX,      // Connections are multiplexed on a single UDP socket
@@ -115,6 +122,8 @@ typedef struct juice_config {
 	juice_cb_recv_t cb_recv;
 
 	void *user_ptr;
+
+	juice_socks5_proxy_t *socks5_proxy; // NULL to disable SOCKS5
 
 } juice_config_t;
 

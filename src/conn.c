@@ -23,18 +23,14 @@
 static conn_mode_entry_t mode_entries[MODE_ENTRIES_SIZE] = {
     {conn_poll_registry_init, conn_poll_registry_cleanup, conn_poll_init, conn_poll_cleanup,
      conn_poll_lock, conn_poll_unlock, conn_poll_interrupt, conn_poll_send, conn_poll_tcp_connect, conn_poll_get_addrs,
-     NULL, NULL, NULL, MUTEX_INITIALIZER, NULL},
+     conn_poll_get_relay_addr, NULL, NULL, NULL, MUTEX_INITIALIZER, NULL},
     {conn_mux_registry_init, conn_mux_registry_cleanup, conn_mux_init, conn_mux_cleanup,
      conn_mux_lock, conn_mux_unlock, conn_mux_interrupt, conn_mux_send, NULL, conn_mux_get_addrs,
-     conn_mux_listen, conn_mux_get_registry, conn_mux_can_release_registry, MUTEX_INITIALIZER, NULL},
+     conn_mux_get_relay_addr, conn_mux_listen, conn_mux_get_registry, conn_mux_can_release_registry, MUTEX_INITIALIZER, NULL},
     {NULL, NULL, conn_thread_init, conn_thread_cleanup,
      conn_thread_lock, conn_thread_unlock, conn_thread_interrupt, conn_thread_send, NULL, conn_thread_get_addrs,
-     NULL, NULL, NULL, MUTEX_INITIALIZER, NULL}
+     conn_thread_get_relay_addr, NULL, NULL, NULL, MUTEX_INITIALIZER, NULL}
 };
-
-#define MODE_ENTRIES_SIZE 3
-
-static conn_mode_entry_t mode_entries[MODE_ENTRIES_SIZE];
 
 conn_mode_entry_t *get_mode_entry(juice_concurrency_mode_t mode) {
 	assert(mode >= 0 && mode < MODE_ENTRIES_SIZE);
@@ -270,6 +266,17 @@ int conn_get_addrs(juice_agent_t *agent, addr_record_t *records, size_t size) {
 	return get_agent_mode_entry(agent)->get_addrs_func(agent, records, size);
 }
 
+int conn_get_relay_addr(juice_agent_t *agent, addr_record_t *relay_addr) {
+	if (!agent->conn_impl)
+		return -1;
+
+	conn_mode_entry_t *entry = get_agent_mode_entry(agent);
+	if (!entry->get_relay_addr_func)
+		return -1;
+
+	return entry->get_relay_addr_func(agent, relay_addr);
+}
+
 int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_incoming_t cb, void *user_ptr) {
 	conn_mode_entry_t *entry = &mode_entries[JUICE_CONCURRENCY_MODE_MUX];
 
@@ -286,6 +293,7 @@ int juice_mux_listen(const char *bind_address, int local_port, juice_cb_mux_inco
 	mutex_lock(&entry->mutex);
 
 	udp_socket_config_t config;
+	memset(&config, 0, sizeof(config));
 	config.bind_address = bind_address;
 	config.port_begin = config.port_end = local_port;
 

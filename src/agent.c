@@ -131,6 +131,27 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 		}
 	}
 
+	if (config->socks5_proxy) {
+		agent->config.socks5_proxy = calloc(1, sizeof(juice_socks5_proxy_t));
+		if (!agent->config.socks5_proxy) {
+			JLOG_FATAL("Memory allocation for SOCKS5 proxy config failed");
+			goto error;
+		}
+		agent->config.socks5_proxy->host =
+		    alloc_string_copy(config->socks5_proxy->host, &alloc_failed);
+		agent->config.socks5_proxy->port = config->socks5_proxy->port;
+		agent->config.socks5_proxy->username =
+		    alloc_string_copy(config->socks5_proxy->username, &alloc_failed);
+		agent->config.socks5_proxy->password =
+		    alloc_string_copy(config->socks5_proxy->password, &alloc_failed);
+		if (alloc_failed) {
+			JLOG_FATAL("Memory allocation for SOCKS5 proxy configuration copy failed");
+			goto error;
+		}
+	} else {
+		agent->config.socks5_proxy = NULL;
+	}
+
 	agent->state = JUICE_STATE_DISCONNECTED;
 	agent->mode = AGENT_MODE_UNKNOWN;
 	agent->selected_entry = NULL;
@@ -178,6 +199,14 @@ void agent_destroy(juice_agent_t *agent) {
 		}
 	}
 
+	// Free SOCKS5 proxy config
+	if (agent->config.socks5_proxy) {
+		free((void *)agent->config.socks5_proxy->host);
+		free((void *)agent->config.socks5_proxy->username);
+		free((void *)agent->config.socks5_proxy->password);
+		free(agent->config.socks5_proxy);
+	}
+
 	// Free strings in config
 	free((void *)agent->config.stun_server_host);
 	for (int i = 0; i < agent->config.turn_servers_count; ++i) {
@@ -207,6 +236,10 @@ static bool has_nonnumeric_server_hostnames(const juice_config_t *config) {
 			return true;
 	}
 
+	if (config->socks5_proxy && config->socks5_proxy->host &&
+	    !addr_is_numeric_hostname(config->socks5_proxy->host))
+		return true;
+
 	return false;
 }
 
@@ -235,12 +268,19 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	socket_config.bind_address = agent->config.bind_address;
 	socket_config.port_begin = agent->config.local_port_range_begin;
 	socket_config.port_end = agent->config.local_port_range_end;
+	if (agent->config.socks5_proxy) {
+		socket_config.proxy_host = agent->config.socks5_proxy->host;
+		socket_config.proxy_port = agent->config.socks5_proxy->port;
+		socket_config.proxy_username = agent->config.socks5_proxy->username;
+		socket_config.proxy_password = agent->config.socks5_proxy->password;
+	}
 
 	if (conn_create(agent, &socket_config)) {
 		JLOG_FATAL("Connection creation for agent failed");
 		return -1;
 	}
 
+	if (!agent->config.socks5_proxy || !agent->config.socks5_proxy->host) {
 	addr_record_t records[ICE_MAX_CANDIDATES_COUNT - 1];
 	int records_count = conn_get_addrs(agent, records, ICE_MAX_CANDIDATES_COUNT - 1);
 	if (records_count < 0) {
@@ -294,6 +334,23 @@ int agent_gather_candidates(juice_agent_t *agent) {
 			}
 		} else {
 			JLOG_WARN("No local host candidates gathered, unable to add TCP candidates");
+		}
+	}
+	} else {
+		addr_record_t relay_addr;
+		conn_lock(agent);
+		if (conn_get_relay_addr(agent, &relay_addr) == 0) {
+			ice_candidate_t candidate;
+			if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_HOST, 1,
+			                               agent->local.candidates_count, &relay_addr, &candidate,
+			                               ICE_CANDIDATE_TRANSPORT_UDP) == 0) {
+				if (agent->local.candidates_count >= MAX_HOST_CANDIDATES_COUNT) {
+					JLOG_WARN(
+					    "Local description already has the maximum number of host candidates");
+				} else {
+					ice_add_candidate(&candidate, &agent->local);
+				}
+			}
 		}
 	}
 
@@ -890,7 +947,7 @@ int agent_conn_tcp_state(juice_agent_t *agent, const addr_record_t *dst, tcp_sta
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 				entry->next_transmission = 0;
 
-				if(entry->pair)
+				if (entry->pair)
 					entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
 
 				conn_interrupt(agent);
@@ -923,10 +980,10 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 				continue;
 
 			if (entry_is_tcp(entry)) {
-			    if (entry->tcp_state == TCP_STATE_DISCONNECTED)
+				if (entry->tcp_state == TCP_STATE_DISCONNECTED)
 					conn_tcp_connect(agent, &entry->record); // First attempt a TCP connection
 
-				if(entry->tcp_state != TCP_STATE_CONNECTED)
+				if (entry->tcp_state != TCP_STATE_CONNECTED)
 					continue;
 			}
 
